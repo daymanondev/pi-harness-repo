@@ -2,7 +2,7 @@
 
 ## Status
 
-in-progress
+implemented
 
 ## Lane
 
@@ -79,4 +79,9 @@ When updating durable proof status, use numeric booleans:
 
 ## Evidence
 
-To be added after validation (typecheck + manual footer render).
+- `npx tsc --noEmit` → exit 0.
+- `tsx` smoke test of `detectHarness` against the live repo → all assertions pass (cli `0.1.11`, db OK, shim present, observer present, `stats.intakes` matches recorded intake).
+- `index.ts` default-export factory loads clean (arity 1).
+- `npm pack --dry-run` confirms a clean publish surface.
+- Durable: trace #2 (standard tier, meets normal-lane requirement).
+- Live pi-session integration not exercised in this environment (flagged in trace notes).

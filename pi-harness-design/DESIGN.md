@@ -516,6 +516,22 @@ task is complete. No trace has been recorded this session. Run
 The footer (§4) also shows a `⚠ no trace` badge in the same state so the human
 can see the gate is unresolved.
 
+**Gate B′ — Drift gate (hard-block on close).** `harness-cli audit` only reads
+the durable layer, so it reports "perfect" while `docs/stories/*.md` and the
+`story` table silently disagree (status mismatch, missing packet, stale
+evidence). This is structural drift the existing audit cannot see. The
+extension runs a `detectDrift(cwd, exec)` cross-check (US-003) and **refuses**
+the done/trace step when `drift.length > 0` for the story being closed:
+
+> "Repository-harness drift gate: the durable row and the story packet
+> disagree for <id> (durable=<x>, markdown=<y>). Sync the packet, then close.
+> `audit` cannot see this — only this gate can."
+
+The footer (§4) shows `🪢 ⚠ N drifted` whenever any drift exists, so the human
+sees entropy accumulating instead of a false "perfect". This is the
+extension-only workaround for the markdown↔durable blind spot; no upstream
+change required.
+
 #### Gate C — Friction capture prompt (non-blocking)
 
 When a `bash` `tool_result` exits non-zero or an `edit` is retried, raise a
