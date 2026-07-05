@@ -585,10 +585,10 @@ prompt weight.
 
 | phase | scope | outcome |
 |---|---|---|
-| **P1** | `detect.ts` + `session_start` footer/widget | always-on status, composes with powerline |
-| **P2** | **Flow enforcement** — intake gate (§9.2 Gate A/A′) + trace gate (B) + friction prompt (C) via `tool_call` / `before_agent_start` | harness Task Loop becomes **non-skippable**; kills the "query matrix failed → skip to code" shortcut |
+| **P1** | `detect.ts` + `session_start` footer/widget | always-on status, composes with powerline; footer also renders `🪢 ⚠ N drifted` badge (drift cross-check, US-003-retired → folded here) |
+| **P2** | **Flow enforcement** — intake gate (§9.2 Gate A/A′) + trace gate (B) + **Gate B′ drift gate** (done-block on markdown↔durable mismatch) + friction prompt (C) via `tool_call` / `before_agent_start` | harness Task Loop becomes **non-skippable**; kills the "query matrix failed → skip to code" shortcut; closes the audit blind spot |
 | **P3** | `/harness` overlay router + **INSTALL view** | one command onboards a new repo end-to-end |
-| **P4** | **DASHBOARD view** (4 tabs) | "visualize & understand harness" core |
+| **P4** | **DASHBOARD view** (5 tabs: +**Drift**) | "visualize & understand harness" core; Drift tab lists markdown↔durable mismatches with fix hints |
 | **P5** | **TIMELINE tab** + observer install + live tail | productizes `harness-observer` |
 | **P6** | `before_agent_start` live-state injection (§9.1) | agent sees current counts |
 | **P7** | typed tools (`harness_intake/query/trace`) | ergonomic agent-driven harness |
