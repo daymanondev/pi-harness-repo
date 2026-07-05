@@ -1,0 +1,32 @@
+{
+  "name": "@earendil-works/pi-harness",
+  "version": "0.1.0",
+  "description": "pi extension that makes repository-harness a first-class citizen: detect it, surface durable state in the footer, and (later) drive install + dashboard + timeline behind one /harness command.",
+  "keywords": [
+    "pi-package"
+  ],
+  "license": "MIT",
+  "type": "module",
+  "main": "./extensions/harness/index.ts",
+  "files": [
+    "extensions",
+    "skills",
+    "README.md"
+  ],
+  "pi": {
+    "extensions": [
+      "./extensions/harness/index.ts"
+    ],
+    "skills": [
+      "./skills"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "^0.80.3",
+    "@types/node": "^26.1.0",
+    "typescript": "^5.9.3"
+  }
+}
