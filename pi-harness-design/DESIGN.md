@@ -631,15 +631,13 @@ changes that.
    for everyone, not just this extension.
 4. **Multi-repo sessions** — the observer is `cwd`-aware via `HARNESS_OBSERVER_DIR`.
    Should `/harness` follow pi's `ctx.cwd` on every open, or cache per session?
-5. **Enforcement bypass UX (§9.2)** — should the intake gate be **hard-block**
-   (agent cannot proceed at all until `intake` lands) or **soft-block** (block
-   with a one-line `/harness` bypass the user can override)? Hard-block is
-   stricter and is the default; soft-block avoids trapping a stuck agent on
-   tasks where intake genuinely does not apply (e.g. reading/exploring). Decide
-   before P2 ships.
-6. **Enforcement scope** — should the gate fire only for `write`/`edit`, or
-   also for `bash` commands that mutate the repo (e.g. `git commit`, `npm
-   install`)? Broad scope is stricter; narrow scope is less noisy.
+5. **Enforcement bypass UX (§9.2)** — **RESOLVED (decision 0009).** Hard-block,
+   no `/harness` bypass in P2. Reads and all `harness-cli` calls are never
+   intercepted, so the agent is never trapped away from investigating; the only
+   way past Gate A is recording an intake. Soft-block override is a P3 concern.
+6. **Enforcement scope** — **RESOLVED (decision 0009).** Narrow scope: Gate A
+   intercepts `write`/`edit` only; `bash` is exempt (classifying mutating bash
+   is fragile + over-blocks legitimate builds). Gate C still nags failed bash.
 
 ---
 

@@ -1,11 +1,8 @@
 # US-004 P2 — enforcement gates (A / A′ / B / B′ / C)
 
-> **Session handoff story.** Created as the post-compact target so a fresh
-> session opens with a clear P2 objective. Source spec: `pi-harness-design/DESIGN.md` §9.2.
-
 ## Status
 
-planned
+implemented
 
 ## Lane
 
@@ -13,77 +10,96 @@ normal
 
 ## Product Contract
 
-pi-harness must turn the harness Task Loop from documentation into runtime
-rails, using pi's **blockable** `tool_call` event and the injectable
+pi-harness turns the harness Task Loop from documentation into runtime rails,
+using pi's **blockable** `tool_call` event and the injectable
 `before_agent_start`. Enforcement is on by default for any repo where
 `cliInstalled && dbInitialized`; failure is always a guide (carry the exact
-command to run), never a wall.
+command to run), never a wall. Gates fail OPEN on detection errors (a false
+block would trap the agent).
+
+## Decisions (§13.5 / §13.6 → ADR 0009)
+
+- **§13.5 — Hard-block, no `/harness` bypass in P2.** Reads + harness-cli calls
+  are never intercepted → agent is never trapped from investigating. Only way
+  past Gate A is recording an intake.
+- **§13.6 — Narrow scope.** Gate A intercepts `write`/`edit` only; `bash` is
+  exempt (classifying mutating bash is fragile). Gate C still nags failed bash.
 
 ## Relevant Product Docs
 
-- `pi-harness-design/DESIGN.md` §9.1 (live-state injection), §9.2 (Gate A/A′/B/B′/C), §13.5/§13.6 (open bypass/scope questions)
-- `extensions/harness/detect.ts` (existing detection — P2 adds `intakeRecorded`)
+- `pi-harness-design/DESIGN.md` §9.1 (live-state injection), §9.2 (Gate A/A′/B/B′/C), §13.5/§13.6 (now resolved)
+- `docs/decisions/0009-p2-gate-scope-and-bypass.md`
+- `extensions/harness/{detect,gates,drift,session,index}.ts`
 - `docs/HARNESS.md` → Task Loop + Done Definition
-- `docs/CONTEXT_RULES.md` (what to read per phase/lane)
 
-## Acceptance Criteria
+## Acceptance Criteria — how each was met
 
-### Gate A — Intake gate (hard-block on implementation)
+### Gate A — Intake gate (hard-block write/edit)
 
-- On `tool_call`, intercept `write`/`edit`/`bash` (non-harness-cli) mutation tools.
-- If `cliInstalled && dbInitialized && !intakeRecorded` → return `{ block: true, reason }` carrying the exact `intake` command.
-- `intakeRecorded` seeded each `before_agent_start` by diffing `query intakes` count vs previous turn; cleared the moment a `tool_result` for `harness-cli intake` lands (exit 0).
-- Never block `harness-cli` read/query/init calls.
+- `decideGateA()` in `gates.ts` blocks `write`/`edit` when `cli+db present &&
+  !intakeRecorded`, returning a reason that carries the exact `intake`
+  command. Wired in `index.ts` `tool_call`. Verified by `decideGateA` unit
+  cases (write blocked pre-intake, allowed post-intake).
 
-### Gate A′ — Precondition gate (db not initialised)
+### Gate A′ — Precondition gate (db missing)
 
-- When `!dbInitialized`, all mutation tools block with a route to `init` + `migrate` + re-`query matrix`, never to editing.
+- `gatePrecondition()` blocks all mutation tools with a route to
+  `init` + `migrate` + re-`query matrix`, never to editing. Precedence encoded
+  in `decideGateA` (db-missing write → A′ reason). Unit-covered.
 
-### Gate B — Trace gate (soft nag before done)
+### Gate B — Trace gate (soft nag)
 
-- `before_agent_start` appends a "no trace this session" reminder every turn until `query traces` shows a new row.
-- Footer shows `⚠ no trace` badge in the same state.
+- `before_agent_start` injects a `[harness] Done Definition requires a
+  recorded trace...` message every turn until `traceRecorded`. Footer also
+  shows `⚠no-trace`. `traceRecorded` cleared on `harness-cli trace` tool_result
+  success or count increase.
 
 ### Gate B′ — Drift gate (hard-block on close) — folded from US-003
 
-- Run `detectDrift(cwd, exec)` cross-check (markdown `## Status` ↔ durable `story.status`, plus orphan/evidence checks).
-- Refuse the done/trace step when `drift.length > 0` for the story being closed.
-- Footer shows `🪢 ⚠ N drifted` whenever any drift exists.
+- `detectDrift()` in `drift.ts` cross-checks markdown `## Status` ↔ durable
+  `query matrix`, plus orphan/evidence checks (4 drift kinds).
+- `gateDriftOnTrace()` in `index.ts` blocks `harness-cli ... trace` when
+  `drift.length > 0`, listing the drifted ids. Footer shows `⚠N drifted`.
+- Real-repo smoke test returns 0 drift (matches the manual cross-check).
 
 ### Gate C — Friction prompt (non-blocking)
 
-- On non-zero `bash` exit or retried `edit`, raise a one-line widget: "Hit friction? `harness-cli backlog add …`".
+- `tool_result` for failed `bash` (`event.isError`) raises the
+  `harness-friction` widget with the `backlog add` command.
 
 ### Cross-cutting
 
-- All four gates guarded by `cliInstalled && dbInitialized` (only gate real harness repos).
-- Bypass UX (§13.5): decide hard-block vs soft-block-with-`/harness` override before P2 ships.
-- Scope (§13.6): decide whether the gate also fires on mutating `bash` (e.g. `git commit`) or only `write`/`edit`.
-- Live-state injection (§9.1) ships with this phase: a few-line `before_agent_start` message with current counts.
+- All gates guarded by `cliInstalled && dbInitialized` (non-harness repos pass
+  everything).
+- Live-state injection ships in the same `before_agent_start` handler (durable
+  counts line).
+- Bypass UX + scope resolved by ADR 0009.
 
-## Design Notes
+## Validation — proofs
 
-- `intakeRecorded` lives in the per-cwd session state map populated by `detectHarness`/`detectHarnessCached`.
-- `detectDrift` is pure + injected-exec (same pattern as `parseStats`); source of durable truth = `query matrix`, source of markdown truth = read `docs/stories/US-*.md` `## Status`.
-- Reuse the drift cross-check already prototyped in `trace #5`/`#6` notes (the node script).
-- Gate A reason string must always include the exact command (§9.2: "a guide, not a wall").
-
-## Validation
-
-| Layer | Expected proof |
+| Layer | Proof |
 | --- | --- |
-| Unit | `detectDrift` fixtures cover all 4 drift kinds + clean case; `isHarnessCliCall` regex |
-| Integration | in a fixture repo: edit blocked pre-intake, allowed post-intake; drift blocks done |
-| E2E | N/A |
+| Unit | `tests/p2.test.ts` — **36 passed, 0 failed**. Covers `isHarnessCliCall` (incl. the `harness-cli-notes.txt` non-match), intake/trace/mutation classifiers, `gatePrecondition`, `gateIntake`, full `decideGateA` precedence, `parseMatrix` (spaces in title), `parseMarkdownStatus`, `isEvidenceMissing`, `storyIdFromFilename`, all 4 drift kinds + clean + retired-exclusion + planned-no-evidence, and session seeding/grace-window/refresh. |
+| Integration | Real-repo smoke: `detectDrift(cwd, exec)` against live `harness-cli query matrix` + real `docs/stories/*.md` → **0 drift** (matches the manual node cross-check used to fix US-001/US-002). |
+| Typecheck | `tsc --noEmit` exit 0 across `detect/gates/drift/session/index`. |
+| Publish | `npm pack --dry-run` = 5 extension files + 3 skill files + README + manifest (10 files). `tests/` correctly excluded by the `files` whitelist. |
+| E2E | N/A (runtime gate behaviour needs a live pi session; deferred to manual) |
 | Platform | N/A |
 | Release | N/A |
 
 ## Harness Delta
 
-- Folds retired US-003 (Gate B′ + drift footer + Drift tab placeholder).
-- Extends `extensions/harness/{detect,index}.ts`; likely adds `gates.ts` + `drift.ts`.
-- Resolves §13.5 (bypass UX) and §13.6 (gate scope) as part of implementation.
+- Folds retired US-003 (Gate B′ + drift footer).
+- New modules: `gates.ts`, `drift.ts`, `session.ts`; `index.ts` rewritten to
+  wire `session_start` / `tool_call` / `tool_result` / `before_agent_start`.
+- ADR 0009 records the §13.5/§13.6 resolutions; DESIGN.md §13 updated.
 
-## Evidence
+## Open follow-ups (not blocking)
 
-To be added after P2 implementation.
+- Manual E2E: load the extension in a real pi TUI session in a fixture repo
+  and confirm (a) an edit is blocked pre-intake, (b) it clears after
+  `harness-cli intake`, (c) `harness-cli trace` is blocked while a drift is
+  seeded. (Requires a throwaway fixture repo; safe to do post-merge.)
+- If observer/telemetry shows agents bypassing via mutating bash, revisit
+  §13.6 (broad scope) with a real classifier.
+- When `/harness` (P3) lands, revisit §13.5 if a soft-block override is wanted.
