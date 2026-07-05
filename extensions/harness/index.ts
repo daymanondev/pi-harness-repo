@@ -99,10 +99,10 @@ function renderFooter(
 
   const badges: string[] = [];
   if (drift.length > 0) {
-    badges.push(fg("warning", ` ⚠${drift.length} drifted`));
+    badges.push(fg("warning", ` !${drift.length} drifted`));
   }
   if (!traceRecorded) {
-    badges.push(fg("warning", " ⚠no-trace"));
+    badges.push(fg("warning", " !no-trace"));
   }
   return base + badges.join("");
 }
@@ -124,17 +124,20 @@ function hintLines(state: HarnessState): string[] | undefined {
 /**
  * Gate B′: refuse the done/trace step while markdown↔durable drift exists.
  * Returns a block decision for a `harness-cli ... trace` tool_call.
+ *
+ * ALWAYS re-runs detectDrift fresh (never trusts driftCache). The gate is the
+ * final keep-out before a task closes, so it must reflect the CURRENT repo,
+ * not a snapshot from session_start / before_agent_start. (Trusting the cache
+ * once caused a false block: the agent fixed a drift mid-turn, then the trace
+ * was still blocked by the stale cache. Caught by dogfooding.)
  */
 async function gateDriftOnTrace(
   cwd: string,
   exec: ExecFn,
   signal?: AbortSignal
 ): Promise<{ block: false } | { block: true; reason: string }> {
-  let drift = driftCache.get(cwd);
-  if (!drift) {
-    drift = await detectDrift(cwd, exec, { signal });
-    driftCache.set(cwd, drift);
-  }
+  const drift = await detectDrift(cwd, exec, { signal });
+  driftCache.set(cwd, drift); // keep footer in sync too
   if (drift.length === 0) return { block: false };
   const { count, ids } = summarizeDrift(drift);
   return {
@@ -164,7 +167,7 @@ function injectionMessage(
     );
     if (drift.length > 0) {
       lines.push(
-        `[harness] ⚠ ${drift.length} markdown↔durable drift detected ` +
+        `[harness] ! ${drift.length} markdown↔durable drift detected ` +
           `(${summarizeDrift(drift).ids}). audit cannot see this; sync before closing.`
       );
     }

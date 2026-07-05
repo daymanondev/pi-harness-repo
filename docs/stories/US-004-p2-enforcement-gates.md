@@ -75,7 +75,7 @@ block would trap the agent).
   counts line).
 - Bypass UX + scope resolved by ADR 0009.
 
-## Validation — proofs
+## Evidence
 
 | Layer | Proof |
 | --- | --- |
