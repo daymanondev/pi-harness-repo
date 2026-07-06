@@ -32,29 +32,86 @@ classified yet — that is this skill's job.
 
 ## Process
 
-> Step bodies live in this section. They are written in US-008; this skeleton
-> fixes only the shape and the order. Each step ends on a checkable completion
-> criterion (to be filled in US-008).
+> Each step ends on a **completion criterion** — a checkable condition that
+> tells you the step is genuinely done. Decomposition heuristics live in
+> `KICK-FORMAT.md`; load it when you reach step 4.
 
 ### 1. Size the input
 
-(_filled in US-008_)
+Read the raw requirement. Ask one question and answer it out loud: **is this
+one small behavior, or a whole product area that needs many stories?**
+
+- If it is one small behavior → **stop**. This is not a kicker job. Redirect to
+  `harness-intake-griller` and end the skill.
+- If it is a product area (an initiative) → continue to step 2.
+
+Also scan the ten hard-gate risk flags from `FEATURE_INTAKE.md` (auth, data
+loss, public contracts, …). Note any that apply; they decide the lane in step 2.
+
+**Done when:** the input is classified as either "one behavior → griller" or
+"initiative → continue", and never both.
 
 ### 2. Record the umbrella intake
 
-(_filled in US-008_)
+Record **exactly one** intake for the whole initiative:
+
+```
+harness-cli intake --type new_initiative --lane <normal|cautious|regulated> \
+  --summary "<one paragraph: the problem, the product area, the why>"
+```
+
+Capture the returned intake id. Every slice this kicker produces will hang off
+this one id — there is no per-slice intake from the kicker.
+
+**Done when:** exactly one `new_initiative` intake row exists for this
+initiative and its id is written down.
 
 ### 3. Write the roadmap — not a spec
 
-(_filled in US-008_)
+Write a short **roadmap** document (initiative notes). It names the product
+areas or milestones — it does **not** list tasks, acceptance criteria, or
+implementation steps. Keep it reference-grade: architecture shape, hard
+constraints, open questions.
+
+Apply the roadmap rule (below): if it grows past a few screens or starts
+behaving like a to-do list, stop and shrink it.
+
+**Done when:** a roadmap exists; it names milestones, not tasks; and no
+acceptance criterion or step-by-step lives in it.
 
 ### 4. Decompose into slices
 
-(_filled in US-008_)
+Load `KICK-FORMAT.md` and break each milestone into **tracer-bullet vertical
+slices**. For each slice write a one-line contract (the end-to-end behavior it
+delivers) and a `blocked-by` if it depends on another slice.
+
+Then quiz the user on three things, and iterate until they approve:
+
+- granularity — too coarse, too fine, or right?
+- dependencies — are the `blocked-by` relationships correct?
+- merge/split — should any slices be combined or split further?
+
+**Done when:** every milestone is decomposed into at least one slice; every
+slice has a one-line contract; the user has approved the list; and no slice is
+larger than its lane's token budget.
 
 ### 5. Sequence and hand off
 
-(_filled in US-008_)
+Order the slices by dependency (blockers first) and create one **planned**
+story row for each, linked to the umbrella intake:
+
+```
+harness-cli story add --id US-NNN --title "<slice contract>" --lane <lane>
+harness-cli story update --id US-NNN --status planned
+```
+
+Then **stop**. Hand only the **first** slice to `harness-intake-griller`, which
+classifies it and fills its packet. The kicker does not write code, does not
+fill packets, and does not start the second slice.
+
+**Done when:** every slice exists as a planned story under the umbrella
+intake; the first slice has been handed to the griller; and **no code has been
+written by the kicker**.
 
 ## The roadmap rule
 
