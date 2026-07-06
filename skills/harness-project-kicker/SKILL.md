@@ -56,7 +56,7 @@ loss, public contracts, …). Note any that apply; they decide the lane in step 
 Record **exactly one** intake for the whole initiative:
 
 ```
-harness-cli intake --type new_initiative --lane <normal|cautious|regulated> \
+harness-cli intake --type new_initiative --lane <tiny|normal|high-risk> \
   --summary "<one paragraph: the problem, the product area, the why>"
 ```
 
@@ -125,6 +125,27 @@ roadmap starts behaving like a work tracker, stop and shrink it.
 The kicker's last step hands the **first slice only** to the
 `harness-intake-griller` skill, which classifies and records that slice. The
 kicker itself does not implement.
+
+## Worked example (the shape a run produces)
+
+Input: _"I want offline mode — gates still block with no network."_
+
+- **Step 1** — this is a product area, not one behavior → continue.
+- **Step 2** — one intake: `intake --type new_initiative --lane high-risk
+  --summary "Offline gate enforcement…"` → id #N.
+- **Step 3** — roadmap names milestones only: _detect offline_, _offline gate
+  decision_, _trace buffering_. No tasks, no acceptance criteria.
+- **Step 4** — slices (one-line contracts, from `KICK-FORMAT.md`):
+  - _US-NNN — detect offline at session_start, surface in footer (end-to-end:
+    detect → footer → test)._
+  - _US-NNN — gates fail-closed when offline (decision + tests)._
+  - _US-NNN — buffer trace locally, sync on reconnect._
+  Quiz the user → approve.
+- **Step 5** — three `planned` stories under intake #N; hand only the first to
+  the griller. **Stop. No code written by the kicker.**
+
+The real validation is the next genuine project kickoff — this example only
+fixes the expected shape.
 
 ## Related
 
