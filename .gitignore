@@ -35,3 +35,6 @@ scripts/bin/harness-cli.exe.real
 # harness-observer local data
 .harness-observer/
 .pi/
+
+# pi-subagent run artifacts (local tooling)
+.pi-subagents/
