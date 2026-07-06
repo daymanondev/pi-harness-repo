@@ -23,10 +23,14 @@
 import {
   isToolCallEventType,
   type ExtensionAPI,
+  type ExtensionCommandContext,
 } from "@earendil-works/pi-coding-agent";
+import { readFile, writeFile } from "node:fs/promises";
+import { join } from "node:path";
 import {
   cliBinaryPath,
   detectHarnessCached,
+  invalidateCache,
   type ExecFn,
   type HarnessState,
 } from "./detect.js";
@@ -37,6 +41,27 @@ import {
   refreshFromCounts,
   seedSession,
 } from "./session.js";
+import {
+  buildInstallPlan,
+  buildShimInsertion,
+  DEFAULT_FLAGS,
+  initialMode,
+  isEnter,
+  isEscape,
+  nextMode,
+  renderInstallLines,
+  routeView,
+  type FgFn,
+  type HarnessView,
+  type InstallFlags,
+  type InstallStep,
+} from "./overlay.js";
+import {
+  parseMatrixNumeric,
+  renderDashboardLines,
+  type DashboardTab,
+  type MatrixRow,
+} from "./dashboard.js";
 
 const STATUS_KEY = "harness";
 const WIDGET_KEY = "harness-hint";
@@ -186,9 +211,272 @@ function injectionMessage(
   return lines.join("\n");
 }
 
+// ─── P3: /harness overlay (DESIGN §5 / §6 / §11) ───────────────────────────
+//
+// The single state-aware command the P1 footer/widget already promise ("Run
+// /harness to install"). Two modes, routed by detect():
+//   INSTALL    harness absent or db missing → confirmation wizard → runner
+//   DASHBOARD  harness ready → tabbed overlay (US-010: matrix tab; US-011:
+//              stats/backlog/tools; US-012: drift). Replaces the P3 STATUS
+//              placeholder.
+//
+// The overlay is a *synchronous* component; all async work (the installer +
+// init + migrate + shim on INSTALL; the `query matrix` fetch + refresh loop on
+// DASHBOARD) runs in the handler, not inside the component. Live in-overlay
+// async re-render is a later polish — DASHBOARD refresh re-opens via the loop.
+
+type HarnessOverlayResult =
+  | { action: "install"; flags: InstallFlags }
+  | { action: "refresh" }
+  | { action: "cancel" }
+  | { action: "close" };
+
+interface HarnessOverlayOpts {
+  view: HarnessView;
+  state: HarnessState;
+  flags: InstallFlags;
+  fg: FgFn;
+  onDone: (result: HarnessOverlayResult) => void;
+  /** DASHBOARD only: active tab. Defaults to "matrix". */
+  tab?: DashboardTab;
+  /** DASHBOARD only: parsed `query matrix --numeric` rows. */
+  matrix?: MatrixRow[];
+}
+
+/**
+ * The overlay Component. Implements the pi-tui Component shape structurally
+ * (render / handleInput / invalidate) without importing the type — the factory
+ * passed to ctx.ui.custom accepts it positionally.
+ *
+ * Keys (INSTALL): Enter/i confirm · m mode · c claude · r dry-run · d initDb ·
+ * Esc cancel. DASHBOARD: 1-4 tabs · t timeline · r refresh · Esc close. Only
+ * single-byte keys, so no kitty/CSI sequence handling is needed.
+ */
+class HarnessOverlayComponent {
+  private view: HarnessView;
+  private state: HarnessState;
+  private flags: InstallFlags;
+  private readonly fg: FgFn;
+  private readonly onDone: (result: HarnessOverlayResult) => void;
+  private tab: DashboardTab;
+  private matrix: MatrixRow[];
+
+  constructor(o: HarnessOverlayOpts) {
+    this.view = o.view;
+    this.state = o.state;
+    this.flags = o.flags;
+    this.fg = o.fg;
+    this.onDone = o.onDone;
+    this.tab = o.tab ?? "matrix";
+    this.matrix = o.matrix ?? [];
+  }
+
+  handleInput(data: string): void {
+    if (isEscape(data)) {
+      this.onDone(this.view === "install" ? { action: "cancel" } : { action: "close" });
+      return;
+    }
+    if (this.view === "install") {
+      if (isEnter(data) || data === "i") {
+        this.onDone({ action: "install", flags: this.flags });
+        return;
+      }
+      if (data === "m") this.flags = { ...this.flags, mode: nextMode(this.flags, this.state) };
+      else if (data === "c") this.flags = { ...this.flags, claude: !this.flags.claude };
+      else if (data === "r") this.flags = { ...this.flags, dryRun: !this.flags.dryRun };
+      else if (data === "d") this.flags = { ...this.flags, initDb: !this.flags.initDb };
+      return;
+    }
+    // DASHBOARD
+    if (data === "r") {
+      this.onDone({ action: "refresh" });
+      return;
+    }
+    const tabKey: Record<string, DashboardTab> = {
+      "1": "matrix",
+      "2": "stats",
+      "3": "backlog",
+      "4": "tools",
+      t: "timeline",
+    };
+    const t = tabKey[data];
+    if (t) this.tab = t;
+  }
+
+  render(width: number): string[] {
+    if (this.view === "install") {
+      const plan = buildInstallPlan(this.flags, { cwd: this.state.cwd });
+      return renderInstallLines(this.state, this.flags, plan, this.fg, width);
+    }
+    return renderDashboardLines(this.state, this.tab, this.matrix, this.fg, width);
+  }
+
+  invalidate(): void {
+    // no cached render state
+  }
+  dispose(): void {
+    // nothing to release
+  }
+}
+
+/**
+ * Execute the confirmed install plan step by step. Each step emits a progress
+ * notify; the first non-zero exit (or thrown exec) stops the run. The "shim"
+ * step is a file write, not a shell command. Returns ok=false + the failing
+ * step label on failure.
+ */
+async function runInstallPlan(
+  pi: ExtensionAPI,
+  ctx: ExtensionCommandContext,
+  plan: InstallStep[]
+): Promise<{ ok: boolean; failedLabel?: string }> {
+  for (const step of plan) {
+    if (ctx.signal?.aborted) return { ok: false, failedLabel: "aborted" };
+
+    if (step.kind === "shim") {
+      try {
+        const agentsPath = join(ctx.cwd, "AGENTS.md");
+        const existing = await readFile(agentsPath, "utf8").catch(() => "");
+        const insertion = buildShimInsertion(existing);
+        if (insertion) {
+          await writeFile(agentsPath, existing + insertion, "utf8");
+          ctx.ui.notify(`✓ ${step.label}`, "info");
+        }
+      } catch (e) {
+        ctx.ui.notify(`✗ ${step.label}: ${(e as Error).message}`, "error");
+        return { ok: false, failedLabel: step.label };
+      }
+      continue;
+    }
+
+    ctx.ui.notify(`▶ ${step.label}…`, "info");
+    try {
+      const res = await pi.exec(step.command, step.args, {
+        cwd: ctx.cwd,
+        signal: ctx.signal,
+        timeout: step.kind === "installer" ? 180_000 : 60_000,
+      });
+      if (res.code !== 0) {
+        const detail = (res.stderr || res.stdout || "").trim().slice(0, 500);
+        ctx.ui.notify(`✗ ${step.label} (exit ${res.code}). ${detail}`, "error");
+        return { ok: false, failedLabel: step.label };
+      }
+    } catch (e) {
+      ctx.ui.notify(`✗ ${step.label}: ${(e as Error).message}`, "error");
+      return { ok: false, failedLabel: step.label };
+    }
+  }
+  return { ok: true };
+}
+
+/** Fetch + parse `query matrix --numeric` for the DASHBOARD view. Best-effort:
+ *  any failure (missing CLI, non-zero exit, thrown exec) yields [] so the tab
+ *  degrades to a dim empty-state row, never throws out of the overlay. */
+async function fetchMatrix(
+  pi: ExtensionAPI,
+  ctx: ExtensionCommandContext
+): Promise<MatrixRow[]> {
+  try {
+    const bin = cliBinaryPath(ctx.cwd);
+    const res = await pi.exec(bin, ["query", "matrix", "--numeric"], {
+      cwd: ctx.cwd,
+      signal: ctx.signal,
+      timeout: 5_000,
+    });
+    return res.code === 0 ? parseMatrixNumeric(res.stdout) : [];
+  } catch {
+    return [];
+  }
+}
+
+/** The /harness command handler: route → overlay → (on confirm) run + refresh. */
+async function handleHarnessCommand(
+  pi: ExtensionAPI,
+  ctx: ExtensionCommandContext
+): Promise<void> {
+  const exec = makeExec(pi);
+  let state: HarnessState;
+  try {
+    state = await detectHarnessCached(ctx.cwd, exec, { signal: ctx.signal });
+  } catch {
+    state = {
+      cwd: ctx.cwd,
+      cliInstalled: false,
+      cliVersion: null,
+      dbInitialized: false,
+      shimPresent: false,
+      claudeShimPresent: false,
+      observerInstalled: false,
+    };
+  }
+
+  const view = routeView(state);
+
+  // Non-TUI / no dialog UI: no overlay. Surface a one-line status and stop.
+  if (ctx.mode !== "tui" || !ctx.hasUI) {
+    ctx.ui.notify(
+      view === "install"
+        ? "repository-harness not installed. Run /harness in interactive mode to install."
+        : `repository-harness ready (cli ${state.cliVersion ?? "?"}). Open /harness in interactive mode for details.`,
+      "info"
+    );
+    return;
+  }
+
+  const { theme } = ctx.ui;
+  const fg: FgFn = (c, t) => theme.fg(c as never, t);
+  const flags: InstallFlags = { ...DEFAULT_FLAGS, mode: initialMode(state) };
+
+  // DASHBOARD: fetch the proof matrix, open the overlay, and loop on refresh
+  // (re-fetch + re-open). INSTALL: single overlay, then runInstallPlan.
+  if (view === "dashboard") {
+    let result: HarnessOverlayResult;
+    do {
+      const matrix = await fetchMatrix(pi, ctx);
+      result = await ctx.ui.custom<HarnessOverlayResult>(
+        (_tui, _theme, _kb, done) =>
+          new HarnessOverlayComponent({ view, state, flags, fg, onDone: done, matrix }),
+        { overlay: true, overlayOptions: { width: "76%", margin: 2 } }
+      );
+    } while (result.action === "refresh");
+    return;
+  }
+
+  const result = await ctx.ui.custom<HarnessOverlayResult>(
+    (_tui, _theme, _kb, done) =>
+      new HarnessOverlayComponent({ view, state, flags, fg, onDone: done }),
+    { overlay: true, overlayOptions: { width: "76%", margin: 2 } }
+  );
+
+  if (result?.action === "install") {
+    const plan = buildInstallPlan(result.flags, { cwd: ctx.cwd });
+    const outcome = await runInstallPlan(pi, ctx, plan);
+    if (outcome.ok) {
+      invalidateCache(ctx.cwd);
+      // re-detect so the footer flips to the live state
+      try {
+        const fresh = await detectHarnessCached(ctx.cwd, exec, { signal: ctx.signal });
+        const session = getSession(ctx.cwd);
+        ctx.ui.setStatus(
+          STATUS_KEY,
+          renderFooter(fresh, driftCache.get(ctx.cwd) ?? [], session.traceRecorded, fg)
+        );
+      } catch {
+        // footer refresh is best-effort
+      }
+      ctx.ui.notify("repository-harness installed — footer is live ✓", "info");
+    }
+  }
+}
+
 // ─── entrypoint ────────────────────────────────────────────────────────────
 
 export default function (pi: ExtensionAPI) {
+  // P3: the /harness command the footer promises (install wizard or status).
+  pi.registerCommand("harness", {
+    description: "Open repository-harness (install wizard or status)",
+    handler: (_args, ctx) => handleHarnessCommand(pi, ctx),
+  });
   // session_start: detect, seed baselines, render footer + widgets.
   pi.on("session_start", async (_event, ctx) => {
     if (!ctx.hasUI) {

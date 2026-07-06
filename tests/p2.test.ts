@@ -368,6 +368,11 @@ test("full gate lifecycle: intake block -> clear -> drift block -> clear", async
       on(event: string, handler: (e: unknown, ctx: unknown) => unknown) {
         handlers.set(event, handler as never);
       },
+      // P3: the extension now registers /harness at setup — capture it.
+      registeredCommands: new Map<string, (args: string, ctx: unknown) => Promise<void>>(),
+      registerCommand(name: string, options: { handler: (args: string, ctx: unknown) => Promise<void> }) {
+        this.registeredCommands.set(name, options.handler);
+      },
       async exec(_cmd: string, args: string[]) {
         if (args[0] === "--version") return { stdout: "harness-cli 0.1.11\n", stderr: "", code: 0, killed: false };
         if (args[0] === "query" && args[1] === "stats")
