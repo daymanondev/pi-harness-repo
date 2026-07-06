@@ -71,7 +71,7 @@ const id = (_c: string, t: string) => t; // identity fg for plain-text assertion
 
 /** Build a DashboardData with empty defaults, overridden by `over`. */
 function dashData(over: Partial<DashboardData> = {}): DashboardData {
-  return { matrix: [], stats: ZERO_STATS, backlog: [], tools: [], drift: [], packets: {}, errors: {}, ...over };
+  return { matrix: [], stats: ZERO_STATS, backlog: [], tools: [], drift: [], timeline: [], packets: {}, errors: {}, ...over };
 }
 
 /** Build a DashboardNav for render assertions (cursor + drill default off). */
@@ -231,7 +231,7 @@ test("renders title, detected-state header, tab strip, footer hints", () => {
   assert.match(text, /db ok/);
   assert.match(text, /1 matrix/);
   assert.match(text, /2 stats.*3 backlog.*4 tools.*5 drift.*t timeline/);
-  assert.match(text, /\[1-5\] tabs.*\[r\] refresh.*\[Esc\] close/);
+  assert.match(text, /\[1-5,t\] tabs.*\[r\] refresh.*\[Esc\] close/);
 });
 test("matrix tab lists every story row with status + id", () => {
   const text = renderDashboardLines(bareState(), nav("matrix"), dashData({ matrix: parseMatrixNumeric(FIXTURE_MATRIX) }), id).join("\n");
@@ -379,18 +379,20 @@ test("drift tab: dim error row when data.errors.drift", () => {
   assert.match(text, /drift unavailable/);
 });
 
-// ─── render: timeline is still the honest P5 placeholder ───────────────────
-
-console.log("=== dashboard: renderDashboardLines (timeline placeholder) ===");
-test("timeline tab still ships-in-P5 placeholder", () => {
+// ─── render: timeline tab (implemented in P5 / US-015) ─────────────────────
+// Full timeline coverage (parser, diff, rows, drill-down, degrade, wiring)
+// lives in tests/p5.test.ts. Here we only sanity-check the tab renders (it is
+// no longer the P4 placeholder) against the shared dashData() fixture.
+console.log("=== dashboard: renderDashboardLines (timeline tab renders) ===");
+test("timeline tab renders its empty-state (no longer the P5 placeholder)", () => {
   const text = renderDashboardLines(bareState(), nav("timeline"), dashData(), id).join("\n");
-  assert.match(text, /timeline tab ships in P5/);
+  assert.match(text, /no observer events recorded yet/);
 });
 
 // ─── drill-down: nav reducer + detail panes (US-014) ─────────────────────
 
 console.log("=== dashboard: reduceDashboardNav (pure) ===");
-const LENS = (m: number, b: number, d: number) => ({ matrix: m, backlog: b, drift: d });
+const LENS = (m: number, b: number, d: number, t = 0) => ({ matrix: m, backlog: b, drift: d, timeline: t });
 
 test("reducer: ↓/j moves cursor down, clamped to list length-1", () => {
   const start: DashboardNav = { tab: "matrix", cursor: 0, drill: null };

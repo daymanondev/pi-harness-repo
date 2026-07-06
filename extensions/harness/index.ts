@@ -61,8 +61,10 @@ import {
   parseStats,
   parseBacklogOpen,
   parseToolsJson,
+  parseEventsJsonl,
   reduceDashboardNav,
   renderDashboardLines,
+  TIMELINE_MAX,
   type DashboardData,
   type DashboardNav,
   type DashboardTab,
@@ -71,6 +73,7 @@ import {
   type StatsCounts,
   type BacklogRow,
   type ToolRow,
+  type TimelineEvent,
   ZERO_STATS,
 } from "./dashboard.js";
 
@@ -279,7 +282,7 @@ class HarnessOverlayComponent {
     this.fg = o.fg;
     this.onDone = o.onDone;
     this.nav = { tab: o.tab ?? "matrix", cursor: 0, drill: null };
-    this.data = o.data ?? { matrix: [], stats: ZERO_STATS, backlog: [], tools: [], drift: [], packets: {}, errors: {} };
+    this.data = o.data ?? { matrix: [], stats: ZERO_STATS, backlog: [], tools: [], drift: [], timeline: [], packets: {}, errors: {} };
   }
 
   handleInput(data: string): void {
@@ -303,6 +306,7 @@ class HarnessOverlayComponent {
       matrix: this.data.matrix.length,
       backlog: this.data.backlog.length,
       drift: this.data.drift.length,
+      timeline: this.data.timeline.length,
     };
     const res = reduceDashboardNav(this.nav, data, lens);
     this.nav = res.nav;
@@ -497,6 +501,24 @@ async function fetchPackets(
   }
 }
 
+/** Read + parse `.harness-observer/events.jsonl` for the TIMELINE tab (US-015).
+ *  Unlike the query tabs this is a direct file read (the observer is a
+ *  companion, not an inbound harness tool). Returns null on any failure
+ *  (file absent / unreadable) so the tab degrades to a dim message, never
+ *  throws. Caps to the last TIMELINE_MAX events (newest are at the tail). */
+async function fetchTimeline(
+  _pi: ExtensionAPI,
+  ctx: ExtensionCommandContext
+): Promise<TimelineEvent[] | null> {
+  try {
+    const file = join(ctx.cwd, ".harness-observer", "events.jsonl");
+    const text = await readFile(file, "utf8");
+    return parseEventsJsonl(text).slice(-TIMELINE_MAX);
+  } catch {
+    return null;
+  }
+}
+
 /** Fetch all DASHBOARD tab data in parallel and build the DashboardData the
  *  renderer consumes. A null result on a tab records an error so that tab
  *  renders a dim error row; `matrix` keeps US-010's empty-on-failure shape. */
@@ -504,25 +526,28 @@ async function fetchDashboardData(
   pi: ExtensionAPI,
   ctx: ExtensionCommandContext
 ): Promise<DashboardData> {
-  const [matrix, stats, backlog, tools, drift, packets] = await Promise.all([
+  const [matrix, stats, backlog, tools, drift, packets, timeline] = await Promise.all([
     fetchMatrix(pi, ctx),
     fetchStatsCounts(pi, ctx),
     fetchBacklogRows(pi, ctx),
     fetchToolRows(pi, ctx),
     fetchDrift(pi, ctx),
     fetchPackets(pi, ctx),
+    fetchTimeline(pi, ctx),
   ]);
   const errors: Partial<Record<DashboardTab, string>> = {};
   if (stats === null) errors.stats = "stats";
   if (backlog === null) errors.backlog = "backlog";
   if (tools === null) errors.tools = "tools";
   if (drift === null) errors.drift = "drift";
+  if (timeline === null) errors.timeline = "timeline";
   return {
     matrix,
     stats: stats ?? ZERO_STATS,
     backlog: backlog ?? [],
     tools: tools ?? [],
     drift: drift ?? [],
+    timeline: timeline ?? [],
     packets,
     errors,
   };

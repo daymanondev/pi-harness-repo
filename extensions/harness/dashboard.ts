@@ -6,9 +6,9 @@
 // aligned when `fg` injects SGR escapes. Every function below is unit-testable
 // with a stub `fg` (identity `(c, t) => t`).
 //
-// US-010 (tracer bullet): ships the shell + tab chrome + the proof-matrix tab
-// only. Tabs 2/3/4 (stats/backlog/tools → US-011) and `t` timeline (P5) render
-// as dim placeholders so the chrome is honest about what exists today.
+// US-010 (tracer bullet): ships the shell + tab chrome + the proof-matrix tab.
+// Tabs 2/3/4 (stats/backlog/tools → US-011) and `t` timeline (US-015) are all
+// implemented; the chrome lists every tab honestly.
 //
 // Data source: `harness-cli query matrix --numeric` — a fixed-column table with
 // NO `--json` flag (open Q1, DESIGN §13.3). The parser keys off the stable
@@ -217,6 +217,81 @@ export function parseToolsJson(stdout: string): ToolRow[] | null {
   return rows;
 }
 
+// ─── timeline parser (`.harness-observer/events.jsonl`) ────────────────────
+
+/** One harness-observer flow event. The observer wraps harness-cli and writes
+ *  one JSONL line per call; `db_before`/`db_after` are per-table count maps the
+ *  timeline renders as the `table: before → after` delta (DESIGN §8.2). */
+export interface TimelineEvent {
+  ts: string;
+  cmd: string[];
+  exit: number;
+  durationMs: number;
+  stdout: string;
+  stderr: string;
+  dbBefore: Record<string, number>;
+  dbAfter: Record<string, number>;
+}
+
+/** Maximum events rendered in the timeline (DESIGN §8.2: "last 50 calls").
+ *  fetchTimeline caps to this; the renderer shows all of `data.timeline`. */
+export const TIMELINE_MAX = 50;
+
+/** Coerce an unknown `db_before`/`db_after` value into a {table: count} map,
+ *  dropping non-numeric entries. Never throws. */
+function toCounts(v: unknown): Record<string, number> {
+  if (!v || typeof v !== "object") return {};
+  const out: Record<string, number> = {};
+  for (const [k, val] of Object.entries(v as Record<string, unknown>)) {
+    if (typeof val === "number" && Number.isFinite(val)) out[k] = val;
+  }
+  return out;
+}
+
+/** Parse `.harness-observer/events.jsonl` text into events. Pure + total: blank
+ *  lines and unparseable / non-object lines are silently skipped, so a partial
+ *  or hand-edited log never throws. Missing fields degrade to zero / empty. */
+export function parseEventsJsonl(text: string): TimelineEvent[] {
+  const out: TimelineEvent[] = [];
+  for (const raw of text.split(/\r?\n/)) {
+    const line = raw.trim();
+    if (!line) continue;
+    let o: unknown;
+    try {
+      o = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    if (!o || typeof o !== "object") continue;
+    const e = o as Record<string, unknown>;
+    out.push({
+      ts: String(e.ts ?? ""),
+      cmd: Array.isArray(e.cmd) ? e.cmd.map(String) : [],
+      exit: Number(e.exit ?? 0),
+      durationMs: Number(e.duration_ms ?? 0),
+      stdout: String(e.stdout ?? ""),
+      stderr: String(e.stderr ?? ""),
+      dbBefore: toCounts(e.db_before),
+      dbAfter: toCounts(e.db_after),
+    });
+  }
+  return out;
+}
+
+/** The changed-table delta for an event: only tables where before ≠ after
+ *  (reads / `--version` yield [] since both maps are empty or equal). This is
+ *  the `intake: 2 → 3` headline the timeline exists to surface. */
+export function timelineDiff(ev: TimelineEvent): { table: string; before: number; after: number }[] {
+  const tables = new Set<string>([...Object.keys(ev.dbBefore), ...Object.keys(ev.dbAfter)]);
+  const out: { table: string; before: number; after: number }[] = [];
+  for (const table of tables) {
+    const before = ev.dbBefore[table] ?? 0;
+    const after = ev.dbAfter[table] ?? 0;
+    if (before !== after) out.push({ table, before, after });
+  }
+  return out;
+}
+
 // ─── dashboard data aggregate (all tabs) ───────────────────────────────────
 
 /**
@@ -231,6 +306,8 @@ export interface DashboardData {
   backlog: BacklogRow[];
   tools: ToolRow[];
   drift: DriftRecord[];
+  /** Last N observer events for the TIMELINE tab (US-015). */
+  timeline: TimelineEvent[];
   /** storyId → packet file (filename + raw markdown), for the story detail pane. */
   packets: Record<string, PacketRef>;
   errors: Partial<Record<DashboardTab, string>>;
@@ -245,7 +322,7 @@ export interface PacketRef {
 // ─── drill-down navigation (US-014) ────────────────────────────────────────
 
 /** Tabs whose body is a selectable list (cursor + drill apply). */
-export type ListTab = "matrix" | "backlog" | "drift";
+export type ListTab = "matrix" | "backlog" | "drift" | "timeline";
 
 /** Which list row is drilled open (kind = which list, index = row). */
 export interface DrillTarget {
@@ -276,7 +353,7 @@ const TAB_KEYS: Record<string, DashboardTab> = {
   t: "timeline",
 };
 
-const LIST_TABS: ReadonlySet<ListTab> = new Set(["matrix", "backlog", "drift"]);
+const LIST_TABS: ReadonlySet<ListTab> = new Set(["matrix", "backlog", "drift", "timeline"]);
 
 function isListTab(tab: DashboardTab): tab is ListTab {
   return LIST_TABS.has(tab as ListTab);
@@ -330,7 +407,7 @@ function extractSection(text: string, heading: string): string {
 export function reduceDashboardNav(
   nav: DashboardNav,
   key: string,
-  lens: { matrix: number; backlog: number; drift: number }
+  lens: { matrix: number; backlog: number; drift: number; timeline: number }
 ): DashboardNavResult {
   if (isEscape(key)) {
     return nav.drill ? { nav: { ...nav, drill: null } } : { nav, action: "close" };
@@ -371,7 +448,7 @@ function statusColor(status: string): string {
  * Render the DASHBOARD view. Pure: pass identity `fg` in tests to assert
  * plain-text substrings. The active tab's content is drawn from `data`; a
  * present `data.errors[tab]` renders a dim error row instead of the data, so a
- * failing query degrades cleanly. The timeline tab is still a P5 placeholder.
+ * failing query degrades cleanly.
  */
 export function renderDashboardLines(
   state: HarnessState,
@@ -418,9 +495,8 @@ export function renderDashboardLines(
     content.push(...renderToolsTab(data, fg, innerW));
   } else if (nav.tab === "drift") {
     content.push(...renderDriftTab(data, nav.cursor, fg, innerW));
-  } else {
-    // timeline — still a P5 placeholder (live tail of harness-observer).
-    content.push(dim("(timeline tab ships in P5)"));
+  } else if (nav.tab === "timeline") {
+    content.push(...renderTimelineTab(data, nav.cursor, fg, innerW));
   }
   content.push("");
 
@@ -429,7 +505,7 @@ export function renderDashboardLines(
     dim(
       nav.drill
         ? "[Esc] back to list"
-        : "[↑↓/j,k] move · [Enter] open · [1-5] tabs · [r] refresh · [Esc] close"
+        : "[↑↓/j,k] move · [Enter] open · [1-5,t] tabs · [r] refresh · [Esc] close"
     )
   );
   return box("repository-harness · dashboard", content, fg, w);
@@ -624,6 +700,84 @@ function renderDriftTab(
   return out;
 }
 
+// ─── timeline render helpers (US-015) ──────────────────────────────────────
+
+/** Compact duration: 340ms / 8.0s / 12s / — (for 0 or non-finite). */
+function formatDuration(ms: number): string {
+  if (!Number.isFinite(ms) || ms < 1) return "—";
+  if (ms < 1000) return `${Math.round(ms)}ms`;
+  const s = ms / 1000;
+  return s < 100 ? `${s.toFixed(1)}s` : `${Math.round(s)}s`;
+}
+
+/** `HH:MM:SS` from an ISO-ish ts ("2026-07-04T10:11:30+00:00" → "10:11:30");
+ *  "" when the time part is absent. */
+function hhmmss(ts: string): string {
+  const m = ts.match(/T(\d{2}:\d{2}:\d{2})/);
+  return m ? m[1]! : "";
+}
+
+/** Joined `table: b→a` delta string for an event (only changed tables; "" when
+ *  none — reads / `--version` produce no delta). */
+function renderTimelineDiff(ev: TimelineEvent): string {
+  const segs = timelineDiff(ev);
+  if (segs.length === 0) return "";
+  return segs.map((s) => `${s.table}: ${s.before}→${s.after}`).join("  ");
+}
+
+/** Render the TIMELINE tab body (US-015): the last N observer events as flow
+ *  rows — time · exit mark · cmd · duration · the db delta — with a selection
+ *  cursor for drill-down. Degrades to a dim message when the file is absent or
+ *  no events exist. Inner width = innerW. */
+function renderTimelineTab(data: DashboardData, cursor: number, fg: FgFn, innerW: number): string[] {
+  const dim = (t: string) => fg("dim", t);
+  if (data.errors.timeline) {
+    return [dim("(timeline unavailable — flow logging is off or .harness-observer/events.jsonl is absent)")];
+  }
+  const events = data.timeline;
+  if (events.length === 0) {
+    return [dim("(no observer events recorded yet)")];
+  }
+  const out: string[] = [];
+  const innerW2 = innerW - MARK_W;
+  const timeW = 8;
+  const exitW = 1; // ✓ / ✗
+  const durW = 8;
+  const gap = 2;
+  const cmdW = 26;
+  const diffW = Math.max(12, innerW2 - (timeW + exitW + durW + cmdW + 4 * gap));
+  out.push(
+    rowMarker(false) +
+      padRight(dim("time"), timeW) +
+      gapSpaces(gap) +
+      padRight("", exitW) +
+      gapSpaces(gap) +
+      padRight(dim("cmd"), cmdW) +
+      gapSpaces(gap) +
+      padRight(dim("dur"), durW) +
+      gapSpaces(gap) +
+      dim("delta")
+  );
+  events.forEach((ev, i) => {
+    const exitMark = ev.exit === 0 ? fg("success", "✓") : fg("error", "✗");
+    const diff = renderTimelineDiff(ev);
+    const diffSeg = diff ? fg("accent", truncateAnsi(diff, diffW)) : padRight("", diffW);
+    out.push(
+      rowMarker(i === cursor) +
+        padRight(hhmmss(ev.ts), timeW) +
+        gapSpaces(gap) +
+        padRight(exitMark, exitW) +
+        gapSpaces(gap) +
+        padRight(truncateAnsi(ev.cmd.join(" "), cmdW), cmdW) +
+        gapSpaces(gap) +
+        padRight(formatDuration(ev.durationMs), durW) +
+        gapSpaces(gap) +
+        diffSeg
+    );
+  });
+  return out;
+}
+
 // ─── detail panes (US-014 drill-down) ──────────────────────────────────────
 
 /** First N non-empty lines of a section body, each truncated to `width`. */
@@ -698,6 +852,35 @@ function renderDriftDetail(rec: DriftRecord, fg: FgFn, innerW: number): string[]
   return out;
 }
 
+/** Render the drilled TIMELINE detail (US-015): full cmd + exit/duration + the
+ *  db delta + stdout/stderr excerpts. Pure. */
+function renderTimelineDetail(ev: TimelineEvent, fg: FgFn, innerW: number): string[] {
+  const dim = (t: string) => fg("dim", t);
+  const out: string[] = [];
+  const time = hhmmss(ev.ts);
+  out.push(`${fg("accent", time || ev.ts)}  ${truncateAnsi(ev.cmd.join(" "), innerW - (time.length + 2))}`);
+  out.push(
+    `${dim("Exit:")} ${ev.exit === 0 ? fg("success", "0") : fg("error", String(ev.exit))}   ` +
+      `${dim("Duration:")} ${formatDuration(ev.durationMs)}`
+  );
+  const diff = renderTimelineDiff(ev);
+  out.push(`${dim("Delta:")} ${diff ? fg("accent", truncateAnsi(diff, innerW - 7)) : dim("(no state change)")}`);
+  const dump = (label: string, body: string): void => {
+    out.push(dim(label + ":"));
+    const text = body.trim();
+    if (!text) {
+      out.push(dim("  (empty)"));
+      return;
+    }
+    for (const l of text.split(/\r?\n/).slice(0, 6)) {
+      out.push(dim("  " + truncateAnsi(l, innerW - 2)));
+    }
+  };
+  dump("stdout", ev.stdout);
+  dump("stderr", ev.stderr);
+  return out;
+}
+
 /** Dispatch a drilled target to its detail renderer (bounds-checked). */
 function renderDetail(
   drill: DrillTarget,
@@ -714,6 +897,11 @@ function renderDetail(
     const row = data.backlog[drill.index];
     if (!row) return [fg("dim", "(row no longer exists — press r to refresh)")];
     return renderBacklogDetail(row, fg, innerW);
+  }
+  if (drill.kind === "timeline") {
+    const ev = data.timeline[drill.index];
+    if (!ev) return [fg("dim", "(row no longer exists — press r to refresh)")];
+    return renderTimelineDetail(ev, fg, innerW);
   }
   const rec = data.drift[drill.index];
   if (!rec) return [fg("dim", "(row no longer exists — press r to refresh)")];
