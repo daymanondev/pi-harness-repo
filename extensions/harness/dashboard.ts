@@ -380,7 +380,11 @@ export function renderDashboardLines(
   fg: FgFn,
   width = BOX_WIDTH
 ): string[] {
-  const w = Math.max(60, Math.min(width, BOX_WIDTH));
+  // Fill the available overlay width (pi resolves OverlayOptions.width="76%" to
+  // a column count and passes it here). The old Math.min(width, BOX_WIDTH) cap
+  // rendered a 76-col box inside a wider overlay → a black void on the right on
+  // wide terminals (intake #19). No upper cap now; only the 60-col floor.
+  const w = Math.max(60, width);
   const content: string[] = [];
   const dim = (t: string) => fg("dim", t);
 

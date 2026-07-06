@@ -518,6 +518,15 @@ test("alignment holds at the narrower floor width (60) on every tab", () => {
     }
   }
 });
+test("dashboard FILLS the available width (no 76-col cap → no right-side void) [intake #19]", () => {
+  const data = dashData({ matrix: parseMatrixNumeric(FIXTURE_MATRIX) });
+  for (const w of [100, 140]) {
+    const lines = renderDashboardLines(bareState(), nav("matrix"), data, id, w);
+    for (const ln of lines) {
+      assert.equal(ansiVisibleWidth(ln), w, `width ${w}: line not filled (box capped?): ${JSON.stringify(ln)}`);
+    }
+  }
+});
 
 // ─── Approach B: wiring through the REAL index.ts ──────────────────────────
 
