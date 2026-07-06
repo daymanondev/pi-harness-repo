@@ -276,7 +276,7 @@ class HarnessOverlayComponent {
     this.fg = o.fg;
     this.onDone = o.onDone;
     this.tab = o.tab ?? "matrix";
-    this.data = o.data ?? { matrix: [], stats: ZERO_STATS, backlog: [], tools: [], errors: {} };
+    this.data = o.data ?? { matrix: [], stats: ZERO_STATS, backlog: [], tools: [], drift: [], errors: {} };
   }
 
   handleInput(data: string): void {
@@ -305,6 +305,7 @@ class HarnessOverlayComponent {
       "2": "stats",
       "3": "backlog",
       "4": "tools",
+      "5": "drift",
       t: "timeline",
     };
     const t = tabKey[data];
@@ -456,6 +457,24 @@ async function fetchToolRows(
   }
 }
 
+/** Fetch drift records for the Drift tab (US-012). `detectDrift` reads
+ *  docs/stories/*.md + runs `query matrix` itself; on exec failure it degrades
+ *  to a synthetic "(query matrix failed)" record, which we map to null so the
+ *  tab renders a dim error row (consistent with the other query tabs). */
+async function fetchDrift(
+  pi: ExtensionAPI,
+  ctx: ExtensionCommandContext
+): Promise<DriftRecord[] | null> {
+  try {
+    const recs = await detectDrift(ctx.cwd, makeExec(pi), { signal: ctx.signal });
+    const failed =
+      recs.length === 1 && recs[0]?.storyId === "(query matrix failed)";
+    return failed ? null : recs;
+  } catch {
+    return null;
+  }
+}
+
 /** Fetch all DASHBOARD tab data in parallel and build the DashboardData the
  *  renderer consumes. A null result on a tab records an error so that tab
  *  renders a dim error row; `matrix` keeps US-010's empty-on-failure shape. */
@@ -463,21 +482,24 @@ async function fetchDashboardData(
   pi: ExtensionAPI,
   ctx: ExtensionCommandContext
 ): Promise<DashboardData> {
-  const [matrix, stats, backlog, tools] = await Promise.all([
+  const [matrix, stats, backlog, tools, drift] = await Promise.all([
     fetchMatrix(pi, ctx),
     fetchStatsCounts(pi, ctx),
     fetchBacklogRows(pi, ctx),
     fetchToolRows(pi, ctx),
+    fetchDrift(pi, ctx),
   ]);
   const errors: Partial<Record<DashboardTab, string>> = {};
   if (stats === null) errors.stats = "stats";
   if (backlog === null) errors.backlog = "backlog";
   if (tools === null) errors.tools = "tools";
+  if (drift === null) errors.drift = "drift";
   return {
     matrix,
     stats: stats ?? ZERO_STATS,
     backlog: backlog ?? [],
     tools: tools ?? [],
+    drift: drift ?? [],
     errors,
   };
 }

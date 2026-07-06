@@ -17,11 +17,12 @@
 // If parsing ever proves fragile, push `--json` upstream (roadmap open Q1).
 
 import type { HarnessState } from "./detect.js";
+import type { DriftRecord } from "./drift.js";
 import { type FgFn, BOX_WIDTH, box, padRight, truncateAnsi } from "./overlay.js";
 
 // ─── tabs ──────────────────────────────────────────────────────────────────
 
-export type DashboardTab = "matrix" | "stats" | "backlog" | "tools" | "timeline";
+export type DashboardTab = "matrix" | "stats" | "backlog" | "tools" | "drift" | "timeline";
 
 /** Tab chrome definition: `key` is the single hotkey that activates the tab. */
 export const DASHBOARD_TABS: { tab: DashboardTab; label: string; key: string }[] = [
@@ -29,6 +30,7 @@ export const DASHBOARD_TABS: { tab: DashboardTab; label: string; key: string }[]
   { tab: "stats", label: "stats", key: "2" },
   { tab: "backlog", label: "backlog", key: "3" },
   { tab: "tools", label: "tools", key: "4" },
+  { tab: "drift", label: "drift", key: "5" },
   { tab: "timeline", label: "timeline", key: "t" },
 ];
 
@@ -221,6 +223,7 @@ export interface DashboardData {
   stats: StatsCounts;
   backlog: BacklogRow[];
   tools: ToolRow[];
+  drift: DriftRecord[];
   errors: Partial<Record<DashboardTab, string>>;
 }
 
@@ -278,6 +281,8 @@ export function renderDashboardLines(
     content.push(...renderBacklogTab(data, fg, innerW));
   } else if (tab === "tools") {
     content.push(...renderToolsTab(data, fg, innerW));
+  } else if (tab === "drift") {
+    content.push(...renderDriftTab(data, fg, innerW));
   } else {
     // timeline — still a P5 placeholder (live tail of harness-observer).
     content.push(dim("(timeline tab ships in P5)"));
@@ -285,7 +290,7 @@ export function renderDashboardLines(
   content.push("");
 
   // ── footer hints ──
-  content.push(dim("[1-4] tabs · [t] timeline · [r] refresh · [Esc] close"));
+  content.push(dim("[1-5] tabs · [t] timeline · [r] refresh · [Esc] close"));
   return box("repository-harness · dashboard", content, fg, w);
 }
 
@@ -423,6 +428,50 @@ function renderToolsTab(data: DashboardData, fg: FgFn, innerW: number): string[]
         gapSpaces(gap) +
         (t.status === "present" ? fg("success", "✓") : fg("dim", "·"))
     );
+  }
+  return out;
+}
+
+/** Render the Drift tab body (US-012): markdown ↔ durable mismatches with
+ *  fix hints, or a clean "no drift" line. Inner width = innerW. Pure. */
+function renderDriftTab(
+  data: DashboardData,
+  fg: FgFn,
+  innerW: number
+): string[] {
+  const dim = (t: string) => fg("dim", t);
+  if (data.errors.drift) {
+    return [dim("(drift unavailable — detectDrift failed)")];
+  }
+  if (data.drift.length === 0) {
+    return [fg("success", "✓ no drift — markdown ↔ durable agree")];
+  }
+  const out: string[] = [];
+  const idW = 8;
+  const kindW = 18;
+  const gap = 2;
+  // reserve 2 cols for the leading colored "!" marker + space
+  const valW = Math.max(16, innerW - (idW + kindW + 2 * gap + 2));
+  out.push(
+    "  " +
+      padRight(dim("story"), idW) +
+      gapSpaces(gap) +
+      padRight(dim("kind"), kindW) +
+      gapSpaces(gap) +
+      dim("durable | markdown")
+  );
+  for (const r of data.drift) {
+    out.push(
+      fg("warning", "!") + " " +
+        padRight(truncateAnsi(r.storyId, idW), idW) +
+        gapSpaces(gap) +
+        padRight(r.kind, kindW) +
+        gapSpaces(gap) +
+        truncateAnsi(`${r.durable} | ${r.markdown}`, valW)
+    );
+    if (r.fixHint) {
+      out.push("    " + dim("→ " + truncateAnsi(r.fixHint, innerW - 4)));
+    }
   }
   return out;
 }

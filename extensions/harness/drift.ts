@@ -36,6 +36,8 @@ export interface DriftRecord {
   markdown: string; // markdown status, or "(no file)"
   kind: DriftKind;
   detail?: string;
+  /** One-line human-facing fix hint; rendered by the dashboard Drift tab. */
+  fixHint?: string;
 }
 
 /** Minimal fs hook so tests can supply fixture markdown content. */
@@ -100,6 +102,107 @@ export function storyIdFromFilename(name: string): string | null {
   return m ? m[1]! : null;
 }
 
+// ─── pure comparison (shared by Gate B′ + the dashboard Drift tab) ─────────
+
+/** Parsed markdown view of one story packet, for drift comparison. */
+export interface MarkdownStory {
+  status: string;
+  evidenceMissing: boolean;
+}
+/** storyId → durable status (parsed from `query matrix`). */
+export type DurableStatusMap = Record<string, string>;
+/** storyId → parsed markdown packet. */
+export type MarkdownStoryMap = Record<string, MarkdownStory>;
+
+/** Active durable statuses that MUST have a packet. `retired` is the sanctioned
+ *  "packet removed" path, so a retired row with no file is NOT drift. */
+const ACTIVE_WITHOUT_PACKET = new Set([
+  "planned",
+  "in_progress",
+  "implemented",
+  "changed",
+]);
+
+/** Human-facing fix hint for a drift kind — shown in the dashboard Drift tab. */
+export function fixHintFor(kind: DriftKind): string {
+  switch (kind) {
+    case "status_mismatch":
+      return "set ## Status in the packet to match the durable row (or update the row)";
+    case "orphan_markdown":
+      return "add a durable story row (harness-cli story add) or retire the packet";
+    case "orphan_durable":
+      return "add the missing docs/stories/US-NNN packet, or retire the durable row";
+    case "missing_evidence":
+      return "fill the ## Evidence section (empty/placeholder for an implemented story)";
+  }
+}
+
+/**
+ * PURE drift comparison over already-parsed durable + markdown inputs.
+ *
+ * Single source of truth for drift logic: Gate B′ (via `detectDrift`) AND the
+ * dashboard Drift tab both call this. Resolves P4 open Q3 ("reuse Gate B′'s
+ * comparison, or generalize into a shared pure function?") in favour of the
+ * shared function. Never throws; returns one `DriftRecord` per mismatch, each
+ * carrying a `fixHint`.
+ */
+export function computeDrift(
+  durable: DurableStatusMap,
+  markdown: MarkdownStoryMap
+): DriftRecord[] {
+  const records: DriftRecord[] = [];
+  const ids = new Set([...Object.keys(durable), ...Object.keys(markdown)]);
+  for (const id of [...ids].sort()) {
+    const dStatus = durable[id];
+    const m = markdown[id];
+
+    if (dStatus && !m) {
+      if (ACTIVE_WITHOUT_PACKET.has(dStatus)) {
+        records.push({
+          storyId: id,
+          durable: dStatus,
+          markdown: "(no file)",
+          kind: "orphan_durable",
+          fixHint: fixHintFor("orphan_durable"),
+        });
+      }
+      continue;
+    }
+    if (!dStatus && m) {
+      records.push({
+        storyId: id,
+        durable: "(no row)",
+        markdown: m.status || "(empty)",
+        kind: "orphan_markdown",
+        fixHint: fixHintFor("orphan_markdown"),
+      });
+      continue;
+    }
+    if (dStatus && m) {
+      if (dStatus !== m.status) {
+        records.push({
+          storyId: id,
+          durable: dStatus,
+          markdown: m.status || "(empty)",
+          kind: "status_mismatch",
+          fixHint: fixHintFor("status_mismatch"),
+        });
+      } else if (m.evidenceMissing && dStatus === "implemented") {
+        // only nag evidence for implemented stories (planned/retired legitimately lack it)
+        records.push({
+          storyId: id,
+          durable: dStatus,
+          markdown: m.status,
+          kind: "missing_evidence",
+          detail: "Evidence section is empty/placeholder",
+          fixHint: fixHintFor("missing_evidence"),
+        });
+      }
+    }
+  }
+  return records;
+}
+
 // ─── detection ─────────────────────────────────────────────────────────────
 
 export interface DriftOptions {
@@ -152,6 +255,7 @@ export async function detectDrift(
         markdown: "?",
         kind: "status_mismatch",
         detail: "detectDrift could not read the durable layer",
+        fixHint: "run `harness-cli query matrix` to confirm the durable layer is readable",
       },
     ];
   }
@@ -173,64 +277,9 @@ export async function detectDrift(
     // no docs/stories dir → every durable story is an orphan_durable
   }
 
-  // retired durable rows with no packet are NOT drift (retire is the sanctioned
-  // "remove the packet" path). Other active statuses without a packet are.
-  const ACTIVE_WITHOUT_PACKET = new Set([
-    "planned",
-    "in_progress",
-    "implemented",
-    "changed",
-  ]);
-
-  const records: DriftRecord[] = [];
-  const ids = new Set([...Object.keys(durable), ...Object.keys(md)]);
-
-  for (const id of [...ids].sort()) {
-    const dStatus = durable[id];
-    const m = md[id];
-
-    if (dStatus && !m) {
-      if (ACTIVE_WITHOUT_PACKET.has(dStatus)) {
-        records.push({
-          storyId: id,
-          durable: dStatus,
-          markdown: "(no file)",
-          kind: "orphan_durable",
-        });
-      }
-      continue;
-    }
-    if (!dStatus && m) {
-      records.push({
-        storyId: id,
-        durable: "(no row)",
-        markdown: m.status || "(empty)",
-        kind: "orphan_markdown",
-      });
-      continue;
-    }
-    if (dStatus && m) {
-      if (dStatus !== m.status) {
-        records.push({
-          storyId: id,
-          durable: dStatus,
-          markdown: m.status || "(empty)",
-          kind: "status_mismatch",
-        });
-      } else if (m.evidenceMissing && dStatus === "implemented") {
-        // only nag evidence for implemented stories (planned/retired legitimately lack it)
-        records.push({
-          storyId: id,
-          durable: dStatus,
-          markdown: m.status,
-          kind: "missing_evidence",
-          detail: "Evidence section is empty/placeholder",
-        });
-      }
-    }
-  }
-
-  return records;
+  // comparison is delegated to the shared pure `computeDrift` (single source
+  // of truth — also drives the dashboard Drift tab, US-012 / P4 open Q3).
+  return computeDrift(durable, md);
 }
 
 /** Format drift records into a single footer-friendly count + id list. */

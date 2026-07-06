@@ -2,7 +2,7 @@
 
 ## Status
 
-planned
+implemented
 
 ## Lane
 
@@ -37,9 +37,20 @@ independent of the read-only query triplet.
 
 ## Design Notes
 
-- **Resolve open Q3 here:** decide which markdown fields and which durable
-  tables are authoritative, and whether to extract Gate B′'s comparison into a
-  shared pure function (preferred — single source of truth for drift logic).
+- **Q3 resolved — generalize into a shared pure function.** Extracted
+  `computeDrift(durable, markdown) → DriftRecord[]` (pure) in
+  `extensions/harness/drift.ts`. Both Gate B′ (`detectDrift`, US-003) and the
+  new Drift tab call it — single source of truth for drift logic. Added a
+  `fixHint` per `DriftKind` so the tab shows actionable guidance, not just the
+  mismatch.
+
+  Authoritative fields:
+  - durable = `story.status` (parsed from `query matrix`).
+  - markdown = `## Status` token + `## Evidence` presence in
+    `docs/stories/US-*.md`.
+  - `retired` durable rows without a packet are NOT drift (retire is the
+    sanctioned "packet removed" path); other active statuses without a packet
+    are.
 
 ## Validation
 
@@ -61,4 +72,21 @@ To be filled by `harness-intake-griller` when this slice is reached.
 
 ## Evidence
 
-_To be added after implementation._
+- `extensions/harness/drift.ts`: new pure `computeDrift()` + `fixHintFor()` +
+  `MarkdownStory` / `DurableStatusMap` / `MarkdownStoryMap` types; `detectDrift`
+  refactored to delegate its comparison loop to `computeDrift` (Gate B′ and the
+  Drift tab now share one definition of drift). `DriftRecord.fixHint` added.
+- `extensions/harness/dashboard.ts`: `DashboardTab` += `"drift"` (hotkey `5`);
+  `DASHBOARD_TABS` + `DashboardData.drift`; `renderDriftTab()` renders each
+  mismatch (kind + `durable | markdown` + fix hint) or a clean "✓ no drift" line,
+  with a dim error row on fetch failure (degrades cleanly, never throws);
+  footer hint updated to `[1-5]`.
+- `extensions/harness/index.ts`: `fetchDrift()` calls `detectDrift` and maps its
+  synthetic "(query matrix failed)" record → `null` so the tab degrades to a dim
+  error row like the other query tabs; wired into `fetchDashboardData` (5-way
+  `Promise.all`) and the `5` keybinding.
+- Validation: `tsc --noEmit` clean; `tests/p4.test.ts` **46/46** (+10 drift
+  tests: `computeDrift` over all 4 kinds + clean, `fixHintFor` exhaustiveness,
+  `renderDriftTab` clean/list/error); **p3 33/33**, **p2 44/44** no regression;
+  lens = 0 errors.
+- Closes backlog #2 (markdown↔durable status drift pattern).

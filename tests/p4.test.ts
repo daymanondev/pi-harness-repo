@@ -28,6 +28,7 @@ import {
 } from "../extensions/harness/dashboard.ts";
 import { ansiVisibleWidth } from "../extensions/harness/overlay.ts";
 import type { HarnessState } from "../extensions/harness/detect.ts";
+import { computeDrift, fixHintFor, type DriftKind } from "../extensions/harness/drift.ts";
 
 let passed = 0;
 let failed = 0;
@@ -67,7 +68,7 @@ const id = (_c: string, t: string) => t; // identity fg for plain-text assertion
 
 /** Build a DashboardData with empty defaults, overridden by `over`. */
 function dashData(over: Partial<DashboardData> = {}): DashboardData {
-  return { matrix: [], stats: ZERO_STATS, backlog: [], tools: [], errors: {}, ...over };
+  return { matrix: [], stats: ZERO_STATS, backlog: [], tools: [], drift: [], errors: {}, ...over };
 }
 
 // Captured `query matrix --numeric` shape (3 rows: implemented / planned / retired;
@@ -221,8 +222,8 @@ test("renders title, detected-state header, tab strip, footer hints", () => {
   assert.match(text, /cli 0\.1\.11/);
   assert.match(text, /db ok/);
   assert.match(text, /1 matrix/);
-  assert.match(text, /2 stats.*3 backlog.*4 tools.*t timeline/);
-  assert.match(text, /\[1-4\] tabs.*\[r\] refresh.*\[Esc\] close/);
+  assert.match(text, /2 stats.*3 backlog.*4 tools.*5 drift.*t timeline/);
+  assert.match(text, /\[1-5\] tabs.*\[r\] refresh.*\[Esc\] close/);
 });
 test("matrix tab lists every story row with status + id", () => {
   const text = renderDashboardLines(bareState(), "matrix", dashData({ matrix: parseMatrixNumeric(FIXTURE_MATRIX) }), id).join("\n");
@@ -297,6 +298,77 @@ test("empty tools → dim empty-state row", () => {
 test("tools fetch error → dim error row", () => {
   const text = renderDashboardLines(bareState(), "tools", dashData({ errors: { tools: "tools" } }), id).join("\n");
   assert.match(text, /tools unavailable/);
+});
+
+// ─── drift: pure computeDrift + Drift tab (US-012) ──────────────────────────
+
+console.log("=== drift: computeDrift (pure) ===");
+test("computeDrift: clean durable↔markdown → no drift", () => {
+  const durable = { "US-1": "implemented", "US-2": "planned" };
+  const md = {
+    "US-1": { status: "implemented", evidenceMissing: false },
+    "US-2": { status: "planned", evidenceMissing: true }, // planned: evidence not required
+  };
+  assert.deepEqual(computeDrift(durable, md), []);
+});
+test("computeDrift: status_mismatch carries durable/markdown + fixHint", () => {
+  const r = computeDrift(
+    { "US-9": "implemented" },
+    { "US-9": { status: "planned", evidenceMissing: false } }
+  );
+  assert.equal(r.length, 1);
+  assert.equal(r[0]!.kind, "status_mismatch");
+  assert.equal(r[0]!.durable, "implemented");
+  assert.equal(r[0]!.markdown, "planned");
+  assert.equal(r[0]!.fixHint, fixHintFor("status_mismatch"));
+});
+test("computeDrift: orphan_markdown (file exists, no durable row)", () => {
+  const r = computeDrift({}, { "US-5": { status: "implemented", evidenceMissing: false } });
+  assert.equal(r.length, 1);
+  assert.equal(r[0]!.kind, "orphan_markdown");
+  assert.equal(r[0]!.durable, "(no row)");
+  assert.equal(r[0]!.fixHint, fixHintFor("orphan_markdown"));
+});
+test("computeDrift: orphan_durable for active rows; retired row is NOT drift", () => {
+  const r = computeDrift({ "US-7": "planned", "US-8": "retired" }, {});
+  assert.equal(r.length, 1);
+  assert.equal(r[0]!.kind, "orphan_durable");
+  assert.equal(r[0]!.storyId, "US-7");
+  assert.equal(r[0]!.markdown, "(no file)");
+});
+test("computeDrift: missing_evidence only for implemented stories", () => {
+  const r = computeDrift(
+    { "US-1": "implemented" },
+    { "US-1": { status: "implemented", evidenceMissing: true } }
+  );
+  assert.equal(r.length, 1);
+  assert.equal(r[0]!.kind, "missing_evidence");
+  assert.ok(/Evidence/.test(r[0]!.fixHint ?? ""));
+});
+test("fixHintFor: every kind has a non-empty hint", () => {
+  const kinds: DriftKind[] = ["status_mismatch", "orphan_markdown", "orphan_durable", "missing_evidence"];
+  for (const k of kinds) assert.ok(fixHintFor(k).length > 0, `hint for ${k}`);
+});
+
+console.log("=== dashboard: renderDashboardLines (drift tab) ===");
+test("drift tab: 'no drift' line when clean", () => {
+  const text = renderDashboardLines(bareState(), "drift", dashData(), id).join("\n");
+  assert.match(text, /no drift.*markdown.*durable agree/);
+});
+test("drift tab: renders each mismatch + its fix hint", () => {
+  const drift = computeDrift(
+    { "US-9": "implemented" },
+    { "US-9": { status: "planned", evidenceMissing: false } }
+  );
+  const text = renderDashboardLines(bareState(), "drift", dashData({ drift }), id).join("\n");
+  assert.match(text, /US-9/);
+  assert.match(text, /status_mismatch/);
+  assert.match(text, /implemented \| planned/);
+  assert.match(text, /## Status/); // fixHint substring
+});
+test("drift tab: dim error row when data.errors.drift", () => {
+  const text = renderDashboardLines(bareState(), "drift", dashData({ errors: { drift: "drift" } }), id).join("\n");
+  assert.match(text, /drift unavailable/);
 });
 
 // ─── render: timeline is still the honest P5 placeholder ───────────────────
@@ -467,7 +539,7 @@ test("installed+db → DASHBOARD route: fetches matrix/stats/backlog/tools, no i
     await registeredCommands.get("harness")!("", ctx as never);
 
     assert.equal(state.customCalls, 1, "dashboard overlay opens exactly once");
-    assert.equal(state.matrixCalls, 1, "fetchMatrix runs query matrix --numeric once");
+    assert.equal(state.matrixCalls, 2, "matrix fetched by fetchMatrix (--numeric) + the drift cross-check (no flag), once each per open");
     for (const sub of ["matrix", "stats", "backlog", "tools"] as const) {
       assert.ok(
         execCalls.some((c) => c.args[0] === "query" && c.args[1] === sub),
@@ -508,6 +580,28 @@ test("tab switch: '2' stats content; '3' backlog content; '4' tools content; '1'
   }
 });
 
+test("drift tab ('5'): surfaces markdown↔durable drift on the live fixture", async () => {
+  const mod = await import("../extensions/harness/index.ts");
+  const cwd = installedRepo();
+  mkdirSync(join(cwd, "docs", "stories"), { recursive: true });
+  // US-001 packet disagrees with the durable row (status_mismatch); US-010 has
+  // no packet at all (orphan_durable) — the same class Gate B′ blocks on.
+  writeFileSync(join(cwd, "docs", "stories", "US-001-foo.md"), "# US-001\n\n## Status\n\nplanned\n");
+  try {
+    const { pi, ctx, state, registeredCommands } = mockHarness(cwd, { keySeqs: [["5", "\u001b"]] });
+    mod.default(pi as never);
+    await registeredCommands.get("harness")!("", ctx as never);
+    const driftRender = state.renders[0]![1]!;
+    assert.match(driftRender, /status_mismatch/);
+    assert.match(driftRender, /US-001/);
+    assert.match(driftRender, /orphan_durable/);
+    assert.match(driftRender, /US-010/);
+    assert.match(driftRender, /## Status/); // a fixHint is rendered
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
 test("refresh loop: 'r' re-fetches all tabs and re-opens the overlay", async () => {
   const mod = await import("../extensions/harness/index.ts");
   const cwd = installedRepo();
@@ -519,7 +613,7 @@ test("refresh loop: 'r' re-fetches all tabs and re-opens the overlay", async () 
     await registeredCommands.get("harness")!("", ctx as never);
 
     assert.equal(state.customCalls, 2, "overlay re-opens once per refresh");
-    assert.equal(state.matrixCalls, 2, "matrix is re-fetched on each refresh");
+    assert.equal(state.matrixCalls, 4, "matrix re-fetched on each refresh by both fetchMatrix + drift (2 opens × 2)");
     // each dashboard tab query is re-fetched on both opens. (detect() also runs a
     // cached `query stats` for the footer counts — that is the +1 over 4×2 — so
     // assert per-subcommand rather than on the raw total.)
