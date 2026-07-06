@@ -5,7 +5,7 @@
 
 ## Status
 
-planned
+implemented
 
 ## Lane
 
@@ -84,4 +84,11 @@ Deliver the `/harness` command that the P1 footer/widget already promises ("Run
 
 ## Evidence
 
-To be added after P3 implementation.
+- **Command + router:** `pi.registerCommand("harness", …)` wired in `extensions/harness/index.ts`; `routeView(state)` routes `!cliInstalled || !dbInitialized` → INSTALL, else STATUS. Guarded by `ctx.mode === "tui"` (non-TUI prints a one-line status notify).
+- **INSTALL view:** overlay Component (`HarnessOverlayComponent`) via `ctx.ui.custom(…, { overlay: true, overlayOptions: { width: "76%", margin: 2 } })`; mode/claude/dry-run/initDb toggles; on confirm runs `buildInstallPlan(flags)` steps through `pi.exec` with per-step `ctx.ui.notify` progress + first-failure stop; on success `invalidateCache` → re-detect → `setStatus` so the footer flips live.
+- **STATUS view:** minimal counts placeholder rendering (full dashboard deferred to P4).
+- **§13.1 resolved:** ADR-0011 — pin to `main` + `?$(date +%s)` cache-bust, exposed as `INSTALLER_REF` constant.
+- **Reuse:** `detectHarnessCached`, `cliBinaryPath`, `invalidateCache`, `getSession`, `renderFooter` — no duplication.
+- **Never crash:** every probe + the overlay + exec are try/catch-wrapped; failures degrade to a notify.
+- **Validation:** `tsc --noEmit` exit 0; `tests/p3.test.ts` 34/34 (pure router/plan/render/shim + Approach-B wiring: register → route → run installer+init+migrate → write shim → success notify; status route opens overlay, no installer exec; non-TUI no-ops the overlay). `tests/p2.test.ts` still 44/44 (mock extended for `registerCommand`).
+- **Note (deferred to P4):** in-overlay streaming progress; v1 streams progress as per-step notifies after the overlay confirms. Windows `.ps1` installer deferred (§13.2).
