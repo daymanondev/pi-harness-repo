@@ -25,7 +25,7 @@ import {
   type ExtensionAPI,
   type ExtensionCommandContext,
 } from "@earendil-works/pi-coding-agent";
-import { readFile, writeFile } from "node:fs/promises";
+import { readFile, readdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import {
   cliBinaryPath,
@@ -61,10 +61,13 @@ import {
   parseStats,
   parseBacklogOpen,
   parseToolsJson,
+  reduceDashboardNav,
   renderDashboardLines,
   type DashboardData,
+  type DashboardNav,
   type DashboardTab,
   type MatrixRow,
+  type PacketRef,
   type StatsCounts,
   type BacklogRow,
   type ToolRow,
@@ -266,7 +269,7 @@ class HarnessOverlayComponent {
   private flags: InstallFlags;
   private readonly fg: FgFn;
   private readonly onDone: (result: HarnessOverlayResult) => void;
-  private tab: DashboardTab;
+  private nav: DashboardNav;
   private data: DashboardData;
 
   constructor(o: HarnessOverlayOpts) {
@@ -275,16 +278,16 @@ class HarnessOverlayComponent {
     this.flags = o.flags;
     this.fg = o.fg;
     this.onDone = o.onDone;
-    this.tab = o.tab ?? "matrix";
-    this.data = o.data ?? { matrix: [], stats: ZERO_STATS, backlog: [], tools: [], drift: [], errors: {} };
+    this.nav = { tab: o.tab ?? "matrix", cursor: 0, drill: null };
+    this.data = o.data ?? { matrix: [], stats: ZERO_STATS, backlog: [], tools: [], drift: [], packets: {}, errors: {} };
   }
 
   handleInput(data: string): void {
-    if (isEscape(data)) {
-      this.onDone(this.view === "install" ? { action: "cancel" } : { action: "close" });
-      return;
-    }
     if (this.view === "install") {
+      if (isEscape(data)) {
+        this.onDone({ action: "cancel" });
+        return;
+      }
       if (isEnter(data) || data === "i") {
         this.onDone({ action: "install", flags: this.flags });
         return;
@@ -295,21 +298,16 @@ class HarnessOverlayComponent {
       else if (data === "d") this.flags = { ...this.flags, initDb: !this.flags.initDb };
       return;
     }
-    // DASHBOARD
-    if (data === "r") {
-      this.onDone({ action: "refresh" });
-      return;
-    }
-    const tabKey: Record<string, DashboardTab> = {
-      "1": "matrix",
-      "2": "stats",
-      "3": "backlog",
-      "4": "tools",
-      "5": "drift",
-      t: "timeline",
+    // DASHBOARD — delegate the full key model to the pure reducer (US-014)
+    const lens = {
+      matrix: this.data.matrix.length,
+      backlog: this.data.backlog.length,
+      drift: this.data.drift.length,
     };
-    const t = tabKey[data];
-    if (t) this.tab = t;
+    const res = reduceDashboardNav(this.nav, data, lens);
+    this.nav = res.nav;
+    if (res.action === "close") this.onDone({ action: "close" });
+    else if (res.action === "refresh") this.onDone({ action: "refresh" });
   }
 
   render(width: number): string[] {
@@ -317,7 +315,7 @@ class HarnessOverlayComponent {
       const plan = buildInstallPlan(this.flags, { cwd: this.state.cwd });
       return renderInstallLines(this.state, this.flags, plan, this.fg, width);
     }
-    return renderDashboardLines(this.state, this.tab, this.data, this.fg, width);
+    return renderDashboardLines(this.state, this.nav, this.data, this.fg, width);
   }
 
   invalidate(): void {
@@ -475,6 +473,30 @@ async function fetchDrift(
   }
 }
 
+/** Fetch story packet files (`docs/stories/US-NNN-*.md`) for the story detail
+ *  pane (US-014). Reads filename + raw text per story; any failure (missing
+ *  dir, read error) yields {} so the story detail degrades to "no packet". */
+async function fetchPackets(
+  _pi: ExtensionAPI,
+  ctx: ExtensionCommandContext
+): Promise<Record<string, PacketRef>> {
+  try {
+    const dir = join(ctx.cwd, "docs", "stories");
+    const entries = await readdir(dir);
+    const out: Record<string, PacketRef> = {};
+    for (const name of entries) {
+      const m = name.match(/^(US-\d+)/);
+      if (!m) continue;
+      const id = m[1]!;
+      const text = await readFile(join(dir, name), "utf8");
+      out[id] = { filename: name, text };
+    }
+    return out;
+  } catch {
+    return {};
+  }
+}
+
 /** Fetch all DASHBOARD tab data in parallel and build the DashboardData the
  *  renderer consumes. A null result on a tab records an error so that tab
  *  renders a dim error row; `matrix` keeps US-010's empty-on-failure shape. */
@@ -482,12 +504,13 @@ async function fetchDashboardData(
   pi: ExtensionAPI,
   ctx: ExtensionCommandContext
 ): Promise<DashboardData> {
-  const [matrix, stats, backlog, tools, drift] = await Promise.all([
+  const [matrix, stats, backlog, tools, drift, packets] = await Promise.all([
     fetchMatrix(pi, ctx),
     fetchStatsCounts(pi, ctx),
     fetchBacklogRows(pi, ctx),
     fetchToolRows(pi, ctx),
     fetchDrift(pi, ctx),
+    fetchPackets(pi, ctx),
   ]);
   const errors: Partial<Record<DashboardTab, string>> = {};
   if (stats === null) errors.stats = "stats";
@@ -500,6 +523,7 @@ async function fetchDashboardData(
     backlog: backlog ?? [],
     tools: tools ?? [],
     drift: drift ?? [],
+    packets,
     errors,
   };
 }

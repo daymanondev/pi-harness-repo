@@ -17,8 +17,8 @@
 // If parsing ever proves fragile, push `--json` upstream (roadmap open Q1).
 
 import type { HarnessState } from "./detect.js";
-import type { DriftRecord } from "./drift.js";
-import { type FgFn, BOX_WIDTH, box, padRight, truncateAnsi } from "./overlay.js";
+import { parseMarkdownStatus, type DriftRecord } from "./drift.js";
+import { type FgFn, BOX_WIDTH, box, isEnter, isEscape, padRight, truncateAnsi } from "./overlay.js";
 
 // ─── tabs ──────────────────────────────────────────────────────────────────
 
@@ -144,6 +144,10 @@ export interface BacklogRow {
   title: string;
   status: string;
   risk: string;
+  /** Free-text tail after risk (predicted_impact + actual_outcome concatenated).
+   *  The two columns are both free text with no delimiter, so they cannot be
+   *  split reliably; kept as one display-only blob. */
+  detail: string;
 }
 
 /**
@@ -156,8 +160,10 @@ export interface BacklogRow {
 export function parseBacklogOpen(stdout: string): BacklogRow[] {
   const rows: BacklogRow[] = [];
   // Regex literal (not `new RegExp(template)`) so the \d/\s/\b escapes survive
-  // any formatter round-trip. Vocab is inlined here, not interpolated.
-  const re = /^(\d+)\s{2,}(.+?)\s{2,}(proposed|accepted|implemented|rejected)\s+(tiny|normal|high-risk)\b/;
+  // any formatter round-trip. Vocab is inlined here, not interpolated. The
+  // trailing predicted_impact/actual_outcome columns are both free text with no
+  // delimiter, so capture the whole tail as one `detail` blob (display-only).
+  const re = /^(\d+)\s{2,}(.+?)\s{2,}(proposed|accepted|implemented|rejected)\s+(tiny|normal|high-risk)\b(?:\s+(.*))?$/;
   for (const raw of stdout.split(/\r?\n/)) {
     const line = raw.replace(/\s+$/, "");
     if (!line) continue;
@@ -168,6 +174,7 @@ export function parseBacklogOpen(stdout: string): BacklogRow[] {
       title: m[2]!.trim(),
       status: m[3]!,
       risk: m[4]!,
+      detail: (m[5] ?? "").trim(),
     });
   }
   return rows;
@@ -224,7 +231,129 @@ export interface DashboardData {
   backlog: BacklogRow[];
   tools: ToolRow[];
   drift: DriftRecord[];
+  /** storyId → packet file (filename + raw markdown), for the story detail pane. */
+  packets: Record<string, PacketRef>;
   errors: Partial<Record<DashboardTab, string>>;
+}
+
+/** A story packet file: filename + raw markdown text (read at overlay open). */
+export interface PacketRef {
+  filename: string;
+  text: string;
+}
+
+// ─── drill-down navigation (US-014) ────────────────────────────────────────
+
+/** Tabs whose body is a selectable list (cursor + drill apply). */
+export type ListTab = "matrix" | "backlog" | "drift";
+
+/** Which list row is drilled open (kind = which list, index = row). */
+export interface DrillTarget {
+  kind: ListTab;
+  index: number;
+}
+
+/** Pure nav state: active tab + cursor (for list tabs) + drilled target. */
+export interface DashboardNav {
+  tab: DashboardTab;
+  cursor: number;
+  drill: DrillTarget | null;
+}
+
+/** Result of reducing one key: new nav + optional close/refresh action. */
+export interface DashboardNavResult {
+  nav: DashboardNav;
+  action?: "close" | "refresh";
+}
+
+/** Hotkey → tab. Shared by the reducer + the component. */
+const TAB_KEYS: Record<string, DashboardTab> = {
+  "1": "matrix",
+  "2": "stats",
+  "3": "backlog",
+  "4": "tools",
+  "5": "drift",
+  t: "timeline",
+};
+
+const LIST_TABS: ReadonlySet<ListTab> = new Set(["matrix", "backlog", "drift"]);
+
+function isListTab(tab: DashboardTab): tab is ListTab {
+  return LIST_TABS.has(tab as ListTab);
+}
+
+function clamp(n: number, lo: number, hi: number): number {
+  return Math.max(lo, Math.min(hi, n));
+}
+
+/** Up arrow: CSI `A` or SS3 `A` (normal + application cursor modes). */
+function isArrowUp(key: string): boolean {
+  return key === "\x1b[A" || key === "\x1bOA";
+}
+/** Down arrow: CSI `B` or SS3 `B`. */
+function isArrowDown(key: string): boolean {
+  return key === "\x1b[B" || key === "\x1bOB";
+}
+
+/** Width of the leading selection-marker column on list tabs. */
+const MARK_W = 2;
+/** Selection marker prefix: `▸ ` for the selected row, two spaces otherwise. */
+function rowMarker(selected: boolean): string {
+  return selected ? "▸ " : "  ";
+}
+
+/** Extract the body of a `## <heading>` section (up to the next `## ` or EOF). */
+function extractSection(text: string, heading: string): string {
+  const escaped = heading.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const re = new RegExp(
+    "##\\s*" + escaped + "\\s*\\n([\\s\\S]*?)(?=\\n##\\s|$)",
+    "i"
+  );
+  const m = text.match(re);
+  return m ? m[1]!.trim() : "";
+}
+
+/**
+ * Pure dashboard key→nav reducer (US-014). The component's `handleInput` is a
+ * thin shell over this, so the full key model is unit-testable without pi.
+ *
+ * - Esc: pop drill if drilled, else close.
+ * - `r`: refresh. `1`-`5`/`t`: switch tab (resets cursor + drill).
+ * - ↑/`k`, ↓/`j`: move cursor on a list tab (clamped; no-op when drilled, on a
+ *   non-list tab, or the list is empty).
+ * - Enter: drill into the selected row of a list tab (no-op when drilled, on a
+ *   non-list tab, or the list is empty).
+ *
+ * `lens` is the current row count per list tab (the component supplies live
+ * lengths so the reducer can clamp/disable without owning the data).
+ */
+export function reduceDashboardNav(
+  nav: DashboardNav,
+  key: string,
+  lens: { matrix: number; backlog: number; drift: number }
+): DashboardNavResult {
+  if (isEscape(key)) {
+    return nav.drill ? { nav: { ...nav, drill: null } } : { nav, action: "close" };
+  }
+  if (key === "r") return { nav, action: "refresh" };
+  const t = TAB_KEYS[key];
+  if (t) return { nav: { tab: t, cursor: 0, drill: null } };
+  // cursor / drill only apply to list tabs, and only when not already drilled
+  if (nav.drill || !isListTab(nav.tab)) return { nav };
+  const len = lens[nav.tab] ?? 0;
+  if (isArrowUp(key) || key === "k") {
+    if (len === 0) return { nav };
+    return { nav: { ...nav, cursor: clamp(nav.cursor - 1, 0, len - 1) } };
+  }
+  if (isArrowDown(key) || key === "j") {
+    if (len === 0) return { nav };
+    return { nav: { ...nav, cursor: clamp(nav.cursor + 1, 0, len - 1) } };
+  }
+  if (isEnter(key)) {
+    if (len === 0) return { nav };
+    return { nav: { ...nav, drill: { kind: nav.tab, index: nav.cursor } } };
+  }
+  return { nav };
 }
 
 // ─── status → color ────────────────────────────────────────────────────────
@@ -246,7 +375,7 @@ function statusColor(status: string): string {
  */
 export function renderDashboardLines(
   state: HarnessState,
-  tab: DashboardTab,
+  nav: DashboardNav,
   data: DashboardData,
   fg: FgFn,
   width = BOX_WIDTH
@@ -264,48 +393,58 @@ export function renderDashboardLines(
 
   // ── tab strip ──
   const tabSegs = DASHBOARD_TABS.map((t) => {
-    const on = t.tab === tab;
+    const on = t.tab === nav.tab;
     const label = `${t.key} ${t.label}`;
     return on ? fg("accent", label) : dim(label);
   });
   content.push(tabSegs.join(dim("   ")));
   content.push("");
 
-  // ── active tab content ──
+  // ── active tab content (or the drilled detail pane) ──
   const innerW = w - 2;
-  if (tab === "matrix") {
-    content.push(...renderMatrixTab(data.matrix, fg, innerW));
-  } else if (tab === "stats") {
+  if (nav.drill) {
+    content.push(...renderDetail(nav.drill, data, fg, innerW));
+  } else if (nav.tab === "matrix") {
+    content.push(...renderMatrixTab(data.matrix, nav.cursor, fg, innerW));
+  } else if (nav.tab === "stats") {
     content.push(...renderStatsTab(data, fg, innerW));
-  } else if (tab === "backlog") {
-    content.push(...renderBacklogTab(data, fg, innerW));
-  } else if (tab === "tools") {
+  } else if (nav.tab === "backlog") {
+    content.push(...renderBacklogTab(data, nav.cursor, fg, innerW));
+  } else if (nav.tab === "tools") {
     content.push(...renderToolsTab(data, fg, innerW));
-  } else if (tab === "drift") {
-    content.push(...renderDriftTab(data, fg, innerW));
+  } else if (nav.tab === "drift") {
+    content.push(...renderDriftTab(data, nav.cursor, fg, innerW));
   } else {
     // timeline — still a P5 placeholder (live tail of harness-observer).
     content.push(dim("(timeline tab ships in P5)"));
   }
   content.push("");
 
-  // ── footer hints ──
-  content.push(dim("[1-5] tabs · [t] timeline · [r] refresh · [Esc] close"));
+  // ── footer hints (context-sensitive: drilled vs list) ──
+  content.push(
+    dim(
+      nav.drill
+        ? "[Esc] back to list"
+        : "[↑↓/j,k] move · [Enter] open · [1-5] tabs · [r] refresh · [Esc] close"
+    )
+  );
   return box("repository-harness · dashboard", content, fg, w);
 }
 
-/** Render the proof-matrix tab body (column header + rows). Inner width = innerW. */
-function renderMatrixTab(matrix: MatrixRow[], fg: FgFn, innerW: number): string[] {
+/** Render the proof-matrix tab body (column header + rows, with a selection
+ *  cursor for drill-down). Inner width = innerW. */
+function renderMatrixTab(matrix: MatrixRow[], cursor: number, fg: FgFn, innerW: number): string[] {
   const dim = (t: string) => fg("dim", t);
   const out: string[] = [];
+  const innerW2 = innerW - MARK_W;
 
   const idW = 7;
   const statusW = 12;
   const proofW = 7; // "✓ ✓ ✓ ✓" / "u i e p" — 4 marks joined by single spaces
   const gap = 2;
-  const titleW = Math.max(10, innerW - (idW + statusW + proofW + 3 * gap));
+  const titleW = Math.max(10, innerW2 - (idW + statusW + proofW + 3 * gap));
 
-  // column header
+  // column header (indented to align with the marker column)
   const head =
     padRight(dim("id"), idW) +
     gapSpaces(gap) +
@@ -314,21 +453,21 @@ function renderMatrixTab(matrix: MatrixRow[], fg: FgFn, innerW: number): string[
     padRight(dim("status"), statusW) +
     gapSpaces(gap) +
     dim("u i e p");
-  out.push(head);
+  out.push(rowMarker(false) + head);
 
   if (matrix.length === 0) {
-    out.push(dim("(no stories — query matrix returned nothing)"));
+    out.push(rowMarker(false) + dim("(no stories — query matrix returned nothing)"));
     return out;
   }
 
-  for (const r of matrix) {
+  matrix.forEach((r, i) => {
     const id = padRight(r.id, idW);
     const title = padRight(truncateAnsi(r.title, titleW), titleW);
     const status = padRight(fg(statusColor(r.status), r.status), statusW);
     const proof =
       proofMark(r.unit, fg) + " " + proofMark(r.integ, fg) + " " + proofMark(r.e2e, fg) + " " + proofMark(r.plat, fg);
-    out.push(id + gapSpaces(gap) + title + gapSpaces(gap) + status + gapSpaces(gap) + proof);
-  }
+    out.push(rowMarker(i === cursor) + id + gapSpaces(gap) + title + gapSpaces(gap) + status + gapSpaces(gap) + proof);
+  });
   return out;
 }
 
@@ -354,20 +493,23 @@ function renderStatsTab(data: DashboardData, fg: FgFn, _innerW: number): string[
   return out;
 }
 
-/** Render the backlog tab body (column header + open rows). innerW = inner width. */
-function renderBacklogTab(data: DashboardData, fg: FgFn, innerW: number): string[] {
+/** Render the backlog tab body (column header + open rows, with a selection
+ *  cursor for drill-down). innerW = inner width. */
+function renderBacklogTab(data: DashboardData, cursor: number, fg: FgFn, innerW: number): string[] {
   const dim = (t: string) => fg("dim", t);
   if (data.errors.backlog) {
     return [dim("(backlog unavailable — query backlog failed)")];
   }
   const out: string[] = [];
+  const innerW2 = innerW - MARK_W;
   const idW = 5;
   const statusW = 12;
   const riskW = 10;
   const gap = 2;
-  const titleW = Math.max(10, innerW - (idW + statusW + riskW + 3 * gap));
+  const titleW = Math.max(10, innerW2 - (idW + statusW + riskW + 3 * gap));
   out.push(
-    padRight(dim("id"), idW) +
+    rowMarker(false) +
+      padRight(dim("id"), idW) +
       gapSpaces(gap) +
       padRight(dim("title"), titleW) +
       gapSpaces(gap) +
@@ -376,12 +518,13 @@ function renderBacklogTab(data: DashboardData, fg: FgFn, innerW: number): string
       padRight(dim("risk"), riskW)
   );
   if (data.backlog.length === 0) {
-    out.push(dim("(no open backlog items)"));
+    out.push(rowMarker(false) + dim("(no open backlog items)"));
     return out;
   }
-  for (const r of data.backlog) {
+  data.backlog.forEach((r, i) => {
     out.push(
-      padRight(String(r.id), idW) +
+      rowMarker(i === cursor) +
+        padRight(String(r.id), idW) +
         gapSpaces(gap) +
         padRight(truncateAnsi(r.title, titleW), titleW) +
         gapSpaces(gap) +
@@ -389,7 +532,7 @@ function renderBacklogTab(data: DashboardData, fg: FgFn, innerW: number): string
         gapSpaces(gap) +
         padRight(r.risk, riskW)
     );
-  }
+  });
   return out;
 }
 
@@ -432,10 +575,11 @@ function renderToolsTab(data: DashboardData, fg: FgFn, innerW: number): string[]
   return out;
 }
 
-/** Render the Drift tab body (US-012): markdown ↔ durable mismatches with
- *  fix hints, or a clean "no drift" line. Inner width = innerW. Pure. */
+/** Render the Drift tab body (US-012 + US-014 cursor): markdown ↔ durable
+ *  mismatches with fix hints, or a clean "no drift" line. Inner width = innerW. */
 function renderDriftTab(
   data: DashboardData,
+  cursor: number,
   fg: FgFn,
   innerW: number
 ): string[] {
@@ -450,19 +594,19 @@ function renderDriftTab(
   const idW = 8;
   const kindW = 18;
   const gap = 2;
-  // reserve 2 cols for the leading colored "!" marker + space
-  const valW = Math.max(16, innerW - (idW + kindW + 2 * gap + 2));
+  // reserve MARK_W cols for the leading selection marker
+  const valW = Math.max(16, innerW - (idW + kindW + 2 * gap + MARK_W));
   out.push(
-    "  " +
+    rowMarker(false) +
       padRight(dim("story"), idW) +
       gapSpaces(gap) +
       padRight(dim("kind"), kindW) +
       gapSpaces(gap) +
       dim("durable | markdown")
   );
-  for (const r of data.drift) {
+  data.drift.forEach((r, i) => {
     out.push(
-      fg("warning", "!") + " " +
+      rowMarker(i === cursor) +
         padRight(truncateAnsi(r.storyId, idW), idW) +
         gapSpaces(gap) +
         padRight(r.kind, kindW) +
@@ -472,8 +616,104 @@ function renderDriftTab(
     if (r.fixHint) {
       out.push("    " + dim("→ " + truncateAnsi(r.fixHint, innerW - 4)));
     }
+  });
+  return out;
+}
+
+// ─── detail panes (US-014 drill-down) ──────────────────────────────────────
+
+/** First N non-empty lines of a section body, each truncated to `width`. */
+function sectionLines(body: string, n: number, width: number, fg: FgFn): string[] {
+  const dim = (t: string) => fg("dim", t);
+  return body
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .filter((l) => l.length > 0)
+    .slice(0, n)
+    .map((l) => dim("  " + truncateAnsi(l, width)));
+}
+
+/** Render the drilled STORY detail: packet-derived status/lane + Acceptance +
+ *  Evidence excerpts + the packet path. Pure. */
+function renderStoryDetail(
+  row: MatrixRow,
+  packet: PacketRef | undefined,
+  fg: FgFn,
+  innerW: number
+): string[] {
+  const dim = (t: string) => fg("dim", t);
+  const out: string[] = [];
+  out.push(`${fg("accent", row.id)}  ${truncateAnsi(row.title, innerW - row.id.length - 2)}`);
+  // status: the packet is authoritative (falls back to the matrix-row status)
+  const mdStatus = packet ? parseMarkdownStatus(packet.text) : "";
+  const status = mdStatus || row.status;
+  const laneRaw = packet ? extractSection(packet.text, "Lane").split(/\r?\n/)[0] ?? "" : "";
+  const lane = laneRaw.trim();
+  out.push(`${dim("Status:")} ${fg(statusColor(status), status)}   ${dim("Lane:")} ${lane || dim("—")}`);
+  if (!packet) {
+    out.push(dim(`(no packet file — orphan durable; add docs/stories/${row.id}-*.md)`));
+    return out;
+  }
+  out.push(dim("Packet: " + truncateAnsi(packet.filename, innerW - 8)));
+  const ac = extractSection(packet.text, "Acceptance Criteria");
+  if (ac) {
+    out.push(dim("Acceptance:"));
+    out.push(...sectionLines(ac, 3, innerW - 2, fg));
+  }
+  const ev = extractSection(packet.text, "Evidence");
+  out.push(dim("Evidence:"));
+  out.push(...(ev ? sectionLines(ev, 2, innerW - 2, fg) : [dim("  (empty — not yet recorded)")]));
+  return out;
+}
+
+/** Render the drilled BACKLOG detail: full fields + the detail tail. Pure. */
+function renderBacklogDetail(row: BacklogRow, fg: FgFn, innerW: number): string[] {
+  const dim = (t: string) => fg("dim", t);
+  const out: string[] = [];
+  out.push(`${fg("accent", "#" + row.id)}  ${truncateAnsi(row.title, innerW - String(row.id).length - 3)}`);
+  out.push(`${dim("Status:")} ${fg(backlogStatusColor(row.status), row.status)}   ${dim("Risk:")} ${row.risk}`);
+  if (row.detail) {
+    out.push(dim("Detail:"));
+    for (const l of row.detail.split(/\r?\n/).slice(0, 4)) {
+      out.push(dim("  " + truncateAnsi(l, innerW - 2)));
+    }
+  } else {
+    out.push(dim("Detail: (none recorded)"));
   }
   return out;
+}
+
+/** Render the drilled DRIFT detail: mismatch sides + the fix hint. Pure. */
+function renderDriftDetail(rec: DriftRecord, fg: FgFn, innerW: number): string[] {
+  const dim = (t: string) => fg("dim", t);
+  const out: string[] = [];
+  out.push(`${fg("warning", rec.storyId)}  ${fg("accent", rec.kind)}`);
+  out.push(`${dim("Durable:")} ${rec.durable}   ${dim("Markdown:")} ${rec.markdown}`);
+  if (rec.detail) out.push(dim(truncateAnsi(rec.detail, innerW)));
+  if (rec.fixHint) out.push(fg("accent", "→ " + truncateAnsi(rec.fixHint, innerW - 2)));
+  return out;
+}
+
+/** Dispatch a drilled target to its detail renderer (bounds-checked). */
+function renderDetail(
+  drill: DrillTarget,
+  data: DashboardData,
+  fg: FgFn,
+  innerW: number
+): string[] {
+  if (drill.kind === "matrix") {
+    const row = data.matrix[drill.index];
+    if (!row) return [fg("dim", "(row no longer exists — press r to refresh)")];
+    return renderStoryDetail(row, data.packets[row.id], fg, innerW);
+  }
+  if (drill.kind === "backlog") {
+    const row = data.backlog[drill.index];
+    if (!row) return [fg("dim", "(row no longer exists — press r to refresh)")];
+    return renderBacklogDetail(row, fg, innerW);
+  }
+  const rec = data.drift[drill.index];
+  if (!rec) return [fg("dim", "(row no longer exists — press r to refresh)")];
+  return renderDriftDetail(rec, fg, innerW);
 }
 
 /** A single proof mark: ✓ (success) for 1, · (dim) for 0. */

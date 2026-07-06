@@ -21,10 +21,13 @@ import {
   parseStats,
   parseBacklogOpen,
   parseToolsJson,
+  reduceDashboardNav,
   renderDashboardLines,
   ZERO_STATS,
   type DashboardData,
+  type DashboardNav,
   type DashboardTab,
+  type DrillTarget,
 } from "../extensions/harness/dashboard.ts";
 import { ansiVisibleWidth } from "../extensions/harness/overlay.ts";
 import type { HarnessState } from "../extensions/harness/detect.ts";
@@ -68,7 +71,12 @@ const id = (_c: string, t: string) => t; // identity fg for plain-text assertion
 
 /** Build a DashboardData with empty defaults, overridden by `over`. */
 function dashData(over: Partial<DashboardData> = {}): DashboardData {
-  return { matrix: [], stats: ZERO_STATS, backlog: [], tools: [], drift: [], errors: {}, ...over };
+  return { matrix: [], stats: ZERO_STATS, backlog: [], tools: [], drift: [], packets: {}, errors: {}, ...over };
+}
+
+/** Build a DashboardNav for render assertions (cursor + drill default off). */
+function nav(tab: DashboardTab, cursor = 0, drill: DrillTarget | null = null): DashboardNav {
+  return { tab, cursor, drill };
 }
 
 // Captured `query matrix --numeric` shape (3 rows: implemented / planned / retired;
@@ -217,7 +225,7 @@ test("malformed JSON → null; non-array → null (never throws)", () => {
 
 console.log("=== dashboard: renderDashboardLines (matrix tab) ===");
 test("renders title, detected-state header, tab strip, footer hints", () => {
-  const text = renderDashboardLines(bareState(), "matrix", dashData({ matrix: parseMatrixNumeric(FIXTURE_MATRIX) }), id).join("\n");
+  const text = renderDashboardLines(bareState(), nav("matrix"), dashData({ matrix: parseMatrixNumeric(FIXTURE_MATRIX) }), id).join("\n");
   assert.match(text, /repository-harness · dashboard/);
   assert.match(text, /cli 0\.1\.11/);
   assert.match(text, /db ok/);
@@ -226,7 +234,7 @@ test("renders title, detected-state header, tab strip, footer hints", () => {
   assert.match(text, /\[1-5\] tabs.*\[r\] refresh.*\[Esc\] close/);
 });
 test("matrix tab lists every story row with status + id", () => {
-  const text = renderDashboardLines(bareState(), "matrix", dashData({ matrix: parseMatrixNumeric(FIXTURE_MATRIX) }), id).join("\n");
+  const text = renderDashboardLines(bareState(), nav("matrix"), dashData({ matrix: parseMatrixNumeric(FIXTURE_MATRIX) }), id).join("\n");
   assert.match(text, /US-001/);
   assert.match(text, /Auth login/);
   assert.match(text, /implemented/);
@@ -236,7 +244,7 @@ test("matrix tab lists every story row with status + id", () => {
   assert.match(text, /retired/);
 });
 test("empty matrix → dim empty-state row (no throw)", () => {
-  const text = renderDashboardLines(bareState(), "matrix", dashData(), id).join("\n");
+  const text = renderDashboardLines(bareState(), nav("matrix"), dashData(), id).join("\n");
   assert.match(text, /no stories/);
 });
 
@@ -244,7 +252,7 @@ test("empty matrix → dim empty-state row (no throw)", () => {
 
 console.log("=== dashboard: renderDashboardLines (stats tab) ===");
 test("renders every count label + its value", () => {
-  const text = renderDashboardLines(bareState(), "stats", dashData({ stats: parseStats(FIXTURE_STATS)! }), id).join("\n");
+  const text = renderDashboardLines(bareState(), nav("stats"), dashData({ stats: parseStats(FIXTURE_STATS)! }), id).join("\n");
   assert.match(text, /intakes/);
   assert.match(text, /stories/);
   assert.match(text, /decisions/);
@@ -254,7 +262,7 @@ test("renders every count label + its value", () => {
   for (const v of ["12", "4", "17"]) assert.match(text, new RegExp(`\\b${v}\\b`), `value ${v}`);
 });
 test("stats fetch error → dim error row, no counts", () => {
-  const text = renderDashboardLines(bareState(), "stats", dashData({ errors: { stats: "stats" } }), id).join("\n");
+  const text = renderDashboardLines(bareState(), nav("stats"), dashData({ errors: { stats: "stats" } }), id).join("\n");
   assert.match(text, /stats unavailable/);
   assert.doesNotMatch(text, /intakes/);
 });
@@ -263,7 +271,7 @@ test("stats fetch error → dim error row, no counts", () => {
 
 console.log("=== dashboard: renderDashboardLines (backlog tab) ===");
 test("renders every open backlog row with status + risk", () => {
-  const text = renderDashboardLines(bareState(), "backlog", dashData({ backlog: parseBacklogOpen(FIXTURE_BACKLOG) }), id).join("\n");
+  const text = renderDashboardLines(bareState(), nav("backlog"), dashData({ backlog: parseBacklogOpen(FIXTURE_BACKLOG) }), id).join("\n");
   assert.match(text, /markdown<->durable/);
   assert.match(text, /proposed/);
   assert.match(text, /tiny/);
@@ -271,11 +279,11 @@ test("renders every open backlog row with status + risk", () => {
   assert.match(text, /implemented/);
 });
 test("empty backlog → dim empty-state row", () => {
-  const text = renderDashboardLines(bareState(), "backlog", dashData(), id).join("\n");
+  const text = renderDashboardLines(bareState(), nav("backlog"), dashData(), id).join("\n");
   assert.match(text, /no open backlog items/);
 });
 test("backlog fetch error → dim error row", () => {
-  const text = renderDashboardLines(bareState(), "backlog", dashData({ errors: { backlog: "backlog" } }), id).join("\n");
+  const text = renderDashboardLines(bareState(), nav("backlog"), dashData({ errors: { backlog: "backlog" } }), id).join("\n");
   assert.match(text, /backlog unavailable/);
 });
 
@@ -284,7 +292,7 @@ test("backlog fetch error → dim error row", () => {
 console.log("=== dashboard: renderDashboardLines (tools tab) ===");
 test("renders every tool with ✓ for present and · for absent", () => {
   const rows = parseToolsJson(FIXTURE_TOOLS_JSON)!;
-  const text = renderDashboardLines(bareState(), "tools", dashData({ tools: rows }), id).join("\n");
+  const text = renderDashboardLines(bareState(), nav("tools"), dashData({ tools: rows }), id).join("\n");
   assert.match(text, /init/);
   assert.match(text, /query matrix/);
   assert.match(text, /Task state/);
@@ -292,11 +300,11 @@ test("renders every tool with ✓ for present and · for absent", () => {
   assert.match(text, /eslint/);
 });
 test("empty tools → dim empty-state row", () => {
-  const text = renderDashboardLines(bareState(), "tools", dashData(), id).join("\n");
+  const text = renderDashboardLines(bareState(), nav("tools"), dashData(), id).join("\n");
   assert.match(text, /no tools registered/);
 });
 test("tools fetch error → dim error row", () => {
-  const text = renderDashboardLines(bareState(), "tools", dashData({ errors: { tools: "tools" } }), id).join("\n");
+  const text = renderDashboardLines(bareState(), nav("tools"), dashData({ errors: { tools: "tools" } }), id).join("\n");
   assert.match(text, /tools unavailable/);
 });
 
@@ -352,7 +360,7 @@ test("fixHintFor: every kind has a non-empty hint", () => {
 
 console.log("=== dashboard: renderDashboardLines (drift tab) ===");
 test("drift tab: 'no drift' line when clean", () => {
-  const text = renderDashboardLines(bareState(), "drift", dashData(), id).join("\n");
+  const text = renderDashboardLines(bareState(), nav("drift"), dashData(), id).join("\n");
   assert.match(text, /no drift.*markdown.*durable agree/);
 });
 test("drift tab: renders each mismatch + its fix hint", () => {
@@ -360,14 +368,14 @@ test("drift tab: renders each mismatch + its fix hint", () => {
     { "US-9": "implemented" },
     { "US-9": { status: "planned", evidenceMissing: false } }
   );
-  const text = renderDashboardLines(bareState(), "drift", dashData({ drift }), id).join("\n");
+  const text = renderDashboardLines(bareState(), nav("drift"), dashData({ drift }), id).join("\n");
   assert.match(text, /US-9/);
   assert.match(text, /status_mismatch/);
   assert.match(text, /implemented \| planned/);
   assert.match(text, /## Status/); // fixHint substring
 });
 test("drift tab: dim error row when data.errors.drift", () => {
-  const text = renderDashboardLines(bareState(), "drift", dashData({ errors: { drift: "drift" } }), id).join("\n");
+  const text = renderDashboardLines(bareState(), nav("drift"), dashData({ errors: { drift: "drift" } }), id).join("\n");
   assert.match(text, /drift unavailable/);
 });
 
@@ -375,8 +383,114 @@ test("drift tab: dim error row when data.errors.drift", () => {
 
 console.log("=== dashboard: renderDashboardLines (timeline placeholder) ===");
 test("timeline tab still ships-in-P5 placeholder", () => {
-  const text = renderDashboardLines(bareState(), "timeline", dashData(), id).join("\n");
+  const text = renderDashboardLines(bareState(), nav("timeline"), dashData(), id).join("\n");
   assert.match(text, /timeline tab ships in P5/);
+});
+
+// ─── drill-down: nav reducer + detail panes (US-014) ─────────────────────
+
+console.log("=== dashboard: reduceDashboardNav (pure) ===");
+const LENS = (m: number, b: number, d: number) => ({ matrix: m, backlog: b, drift: d });
+
+test("reducer: ↓/j moves cursor down, clamped to list length-1", () => {
+  const start: DashboardNav = { tab: "matrix", cursor: 0, drill: null };
+  const a = reduceDashboardNav(start, "\x1b[B", LENS(3, 0, 0)).nav;
+  assert.equal(a.cursor, 1);
+  const b = reduceDashboardNav(a, "\x1b[B", LENS(3, 0, 0)).nav;
+  assert.equal(b.cursor, 2);
+  // clamp at len-1
+  const c = reduceDashboardNav(b, "\x1b[B", LENS(3, 0, 0)).nav;
+  assert.equal(c.cursor, 2);
+});
+test("reducer: ↑/k moves cursor up, clamped to 0", () => {
+  const start: DashboardNav = { tab: "matrix", cursor: 2, drill: null };
+  const a = reduceDashboardNav(start, "k", LENS(3, 0, 0)).nav;
+  assert.equal(a.cursor, 1);
+  const b = reduceDashboardNav(a, "\x1b[A", LENS(3, 0, 0)).nav;
+  assert.equal(b.cursor, 0);
+  const c = reduceDashboardNav(b, "k", LENS(3, 0, 0)).nav;
+  assert.equal(c.cursor, 0);
+});
+test("reducer: Enter drills selected row; Esc pops back (not close); Esc on list closes", () => {
+  const start: DashboardNav = { tab: "matrix", cursor: 1, drill: null };
+  const d = reduceDashboardNav(start, "\r", LENS(3, 0, 0)).nav;
+  assert.deepEqual(d.drill, { kind: "matrix", index: 1 });
+  // Esc while drilled → pop only
+  const back = reduceDashboardNav(d, "\u001b", LENS(3, 0, 0));
+  assert.equal(back.nav.drill, null);
+  assert.equal(back.action, undefined);
+  // Esc when not drilled → close
+  const close = reduceDashboardNav(back.nav, "\u001b", LENS(3, 0, 0));
+  assert.equal(close.action, "close");
+});
+test("reducer: tab switch (1-5/t) resets cursor + drill", () => {
+  const start: DashboardNav = { tab: "matrix", cursor: 2, drill: { kind: "matrix", index: 2 } };
+  const r = reduceDashboardNav(start, "3", LENS(0, 0, 0)).nav;
+  assert.equal(r.tab, "backlog");
+  assert.equal(r.cursor, 0);
+  assert.equal(r.drill, null);
+});
+test("reducer: empty list disables drill + cursor move", () => {
+  const start: DashboardNav = { tab: "drift", cursor: 0, drill: null };
+  assert.equal(reduceDashboardNav(start, "\r", LENS(0, 0, 0)).nav.drill, null);
+  assert.equal(reduceDashboardNav(start, "j", LENS(0, 0, 0)).nav.cursor, 0);
+});
+test("reducer: cursor/drill no-op on non-list tabs (stats/tools)", () => {
+  const start: DashboardNav = { tab: "stats", cursor: 0, drill: null };
+  assert.equal(reduceDashboardNav(start, "j", LENS(0, 0, 0)).nav.cursor, 0);
+  assert.equal(reduceDashboardNav(start, "\r", LENS(0, 0, 0)).nav.drill, null);
+});
+test("reducer: drilled state ignores cursor keys + Enter (Esc is the only exit)", () => {
+  const drilled: DashboardNav = { tab: "backlog", cursor: 1, drill: { kind: "backlog", index: 1 } };
+  assert.equal(reduceDashboardNav(drilled, "j", LENS(0, 5, 0)).nav.cursor, 1);
+  assert.equal(reduceDashboardNav(drilled, "\r", LENS(0, 5, 0)).nav.drill?.index, 1);
+});
+
+console.log("=== dashboard: detail panes (drill-down) ===");
+const PACKET = (id: string, status: string, lane: string, ac: string, ev: string) => ({
+  filename: `${id}-foo.md`,
+  text: `# ${id} Title\n\n## Status\n\n${status}\n\n## Lane\n\n${lane}\n\n## Acceptance Criteria\n\n${ac}\n\n## Evidence\n\n${ev}\n`,
+});
+
+test("story detail: renders id, status, lane, packet path, AC + Evidence excerpts", () => {
+  const row = { id: "US-014", title: "Drill-down navigator", status: "in_progress", unit: 0, integ: 0, e2e: 0, plat: 0 };
+  const data = dashData({
+    matrix: [row],
+    packets: { "US-014": PACKET("US-014", "in_progress", "normal", "- Cursor moves.\n- Enter drills.", "t=42 passed") },
+  });
+  const text = renderDashboardLines(bareState(), nav("matrix", 0, { kind: "matrix", index: 0 }), data, id).join("\n");
+  assert.match(text, /US-014/);
+  assert.match(text, /in_progress/);
+  assert.match(text, /Lane:.*normal/);
+  assert.match(text, /US-014-foo\.md/);
+  assert.match(text, /Cursor moves/);
+  assert.match(text, /t=42 passed/);
+});
+test("story detail: missing packet → '(no packet file — orphan durable)'", () => {
+  const row = { id: "US-999", title: "Ghost story", status: "planned", unit: 0, integ: 0, e2e: 0, plat: 0 };
+  const data = dashData({ matrix: [row], packets: {} });
+  const text = renderDashboardLines(bareState(), nav("matrix", 0, { kind: "matrix", index: 0 }), data, id).join("\n");
+  assert.match(text, /no packet file/);
+  assert.match(text, /US-999/);
+});
+test("backlog detail: renders full fields + detail tail", () => {
+  const row = { id: 5, title: "Dashboard view-only", status: "proposed", risk: "normal", detail: "Turns gauge into control surface." };
+  const data = dashData({ backlog: [row] });
+  const text = renderDashboardLines(bareState(), nav("backlog", 0, { kind: "backlog", index: 0 }), data, id).join("\n");
+  assert.match(text, /Dashboard view-only/);
+  assert.match(text, /proposed/);
+  assert.match(text, /Risk:.*normal/);
+  assert.match(text, /Turns gauge into control surface/);
+});
+test("drift detail: renders mismatch sides + fix hint", () => {
+  const drift = computeDrift({ "US-9": "implemented" }, { "US-9": { status: "planned", evidenceMissing: false } });
+  const data = dashData({ drift });
+  const text = renderDashboardLines(bareState(), nav("drift", 0, { kind: "drift", index: 0 }), data, id).join("\n");
+  assert.match(text, /US-9/);
+  assert.match(text, /status_mismatch/);
+  assert.match(text, /Durable:.*implemented/);
+  assert.match(text, /Markdown:.*planned/);
+  assert.match(text, /## Status/); // fixHint substring
 });
 
 // ─── render: box-width alignment ───────────────────────────────────────────
@@ -390,7 +504,7 @@ const fullData = dashData({
 });
 test("every rendered line is exactly the box width (76 outer) on every tab", () => {
   for (const tab of ["matrix", "stats", "backlog", "tools", "timeline"] as DashboardTab[]) {
-    const lines = renderDashboardLines(bareState(), tab, fullData, id, 76);
+    const lines = renderDashboardLines(bareState(), nav(tab), fullData, id, 76);
     for (const ln of lines) {
       assert.equal(ansiVisibleWidth(ln), 76, `${tab}: line not 76 cols: ${JSON.stringify(ln)}`);
     }
@@ -398,7 +512,7 @@ test("every rendered line is exactly the box width (76 outer) on every tab", () 
 });
 test("alignment holds at the narrower floor width (60) on every tab", () => {
   for (const tab of ["matrix", "stats", "backlog", "tools"] as DashboardTab[]) {
-    const lines = renderDashboardLines(bareState(), tab, fullData, id, 60);
+    const lines = renderDashboardLines(bareState(), nav(tab), fullData, id, 60);
     for (const ln of lines) {
       assert.equal(ansiVisibleWidth(ln), 60, `${tab}: line not 60 cols: ${JSON.stringify(ln)}`);
     }
