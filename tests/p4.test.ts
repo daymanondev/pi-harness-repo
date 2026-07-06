@@ -3,13 +3,14 @@
 // Run: npx tsx tests/p4.test.ts
 //
 // Two layers, mirroring tests/p3.test.ts:
-//   1. Pure dashboard.ts logic (matrix parser, dashboard renderer, box-width
-//      alignment, tab placeholders).
+//   1. Pure dashboard.ts logic (matrix/stats/backlog/tools parsers, dashboard
+//      renderer, box-width alignment, tab placeholders).
 //   2. Approach-B wiring: load the REAL index.ts, capture pi.registerCommand,
 //      drive the /harness handler against an installed+db fixture with a mock
-//      ExtensionAPI whose exec returns `query matrix --numeric` output. Exercises
-//      route → fetchMatrix → overlay (dashboard) → tab switch → refresh loop →
-//      close, plus failing-query degradation — without an LLM.
+//      ExtensionAPI whose exec returns `query matrix/stats/backlog/tools`
+//      output. Exercises route → fetchDashboardData → overlay (dashboard) →
+//      tab switch → refresh loop → close, plus failing-query degradation —
+//      without an LLM.
 
 import assert from "node:assert/strict";
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
@@ -17,9 +18,13 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   parseMatrixNumeric,
+  parseStats,
+  parseBacklogOpen,
+  parseToolsJson,
   renderDashboardLines,
+  ZERO_STATS,
+  type DashboardData,
   type DashboardTab,
-  type MatrixRow,
 } from "../extensions/harness/dashboard.ts";
 import { ansiVisibleWidth } from "../extensions/harness/overlay.ts";
 import type { HarnessState } from "../extensions/harness/detect.ts";
@@ -60,6 +65,11 @@ function bareState(over: Partial<HarnessState> = {}): HarnessState {
 }
 const id = (_c: string, t: string) => t; // identity fg for plain-text assertions
 
+/** Build a DashboardData with empty defaults, overridden by `over`. */
+function dashData(over: Partial<DashboardData> = {}): DashboardData {
+  return { matrix: [], stats: ZERO_STATS, backlog: [], tools: [], errors: {}, ...over };
+}
+
 // Captured `query matrix --numeric` shape (3 rows: implemented / planned / retired;
 // titles include spaces + punctuation to exercise the parser).
 const FIXTURE_MATRIX =
@@ -69,7 +79,31 @@ const FIXTURE_MATRIX =
   "US-002  Manager roles                                                     planned      0     0      0    0\n" +
   "US-003  Old/replaced thing                                                retired      0     0      0    0\n";
 
-// ─── parser ────────────────────────────────────────────────────────────────
+// Captured `query stats` shape (title + header + separator + one data row).
+const FIXTURE_STATS =
+  "=== Harness Stats ===\n" +
+  "intakes  stories  decisions  backlog_items  traces\n" +
+  "-------  -------  ---------  -------------  ------\n" +
+  "12       12       4          4              17    \n";
+
+// Captured `query backlog --open` shape: free-text titles (incl. '<->' and "'"),
+// 2-space column gaps, trailing free-text predicted_impact the parser ignores.
+const FIXTURE_BACKLOG =
+  "id  title                                    status    risk  predicted_impact  actual_outcome\n" +
+  "--  ---------------------------------------  --------  ----  ----------------  --------------\n" +
+  "2   markdown<->durable status drift pattern  proposed  tiny  A cross-check makes drift visible within one session.\n" +
+  "3   Gate B' over-blocks compound scripts     implemented  tiny  Inspect argv instead of substring-grepping.\n";
+
+// Captured `query tools --json` shape (native JSON; missing-status row exercises
+// the · mark, unknown fields degrade to placeholders).
+const FIXTURE_TOOLS_JSON = JSON.stringify([
+  { name: "init", kind: "builtin", responsibility: "Task state", status: "present" },
+  { name: "query matrix", kind: "builtin", responsibility: "Task state", status: "present" },
+  { name: "eslint", kind: "external", responsibility: "Verification", status: "absent" },
+  { name: "ghost", kind: "builtin" }, // missing responsibility + status → placeholders
+]);
+
+// ─── parser: matrix ────────────────────────────────────────────────────────
 
 console.log("=== dashboard: parseMatrixNumeric ===");
 test("parses rows: id, title (with spaces), status, 4 proof cols", () => {
@@ -106,12 +140,83 @@ test("a malformed data row (missing proof cols) is skipped, not crashed", () => 
   assert.equal(rows[0]!.id, "US-010");
 });
 
+// ─── parser: stats ─────────────────────────────────────────────────────────
+
+console.log("=== dashboard: parseStats ===");
+test("parses the 5 counts past title + header + separator", () => {
+  const c = parseStats(FIXTURE_STATS);
+  assert.deepEqual(c, {
+    intakes: 12,
+    stories: 12,
+    decisions: 4,
+    backlogItems: 4,
+    traces: 17,
+  });
+});
+test("empty / garbage / header-only stdout → null (never throws)", () => {
+  assert.equal(parseStats(""), null);
+  assert.equal(parseStats("noise\n"), null);
+  assert.equal(parseStats("=== Harness Stats ===\nintakes  stories  decisions  backlog_items  traces\n"), null);
+});
+test("ignores a trailing extra numeric column (takes first 5)", () => {
+  const out =
+    "intakes  stories  decisions  backlog_items  traces  extra\n" +
+    "-------  -------  ---------  -------------  ------  -----\n" +
+    "1        2        3          4              5       99\n";
+  const c = parseStats(out);
+  assert.equal(c?.intakes, 1);
+  assert.equal(c?.traces, 5);
+});
+
+// ─── parser: backlog ───────────────────────────────────────────────────────
+
+console.log("=== dashboard: parseBacklogOpen ===");
+test("parses id/title/status/risk; title keeps spaces + special chars", () => {
+  const rows = parseBacklogOpen(FIXTURE_BACKLOG);
+  assert.equal(rows.length, 2);
+  assert.equal(rows[0]!.id, 2);
+  assert.equal(rows[0]!.title, "markdown<->durable status drift pattern");
+  assert.equal(rows[0]!.status, "proposed");
+  assert.equal(rows[0]!.risk, "tiny");
+  assert.equal(rows[1]!.title, "Gate B' over-blocks compound scripts");
+  assert.equal(rows[1]!.status, "implemented");
+});
+test("skips header + separator (no false rows); ignores trailing free text", () => {
+  const rows = parseBacklogOpen(FIXTURE_BACKLOG);
+  assert.ok(rows.every((r) => typeof r.id === "number"));
+  assert.ok(!rows.some((r) => /predicted_impact/.test(r.title)));
+});
+test("empty stdout → [] (never throws)", () => {
+  assert.deepEqual(parseBacklogOpen(""), []);
+});
+
+// ─── parser: tools (JSON) ──────────────────────────────────────────────────
+
+console.log("=== dashboard: parseToolsJson ===");
+test("parses JSON array into rows (name/kind/responsibility/status)", () => {
+  const rows = parseToolsJson(FIXTURE_TOOLS_JSON)!;
+  assert.equal(rows.length, 4);
+  assert.equal(rows[0]!.name, "init");
+  assert.equal(rows[0]!.status, "present");
+  assert.equal(rows[2]!.status, "absent");
+});
+test("missing fields degrade to placeholders ('-' / '?'), never throw", () => {
+  const rows = parseToolsJson(FIXTURE_TOOLS_JSON)!;
+  const ghost = rows[3]!;
+  assert.equal(ghost.responsibility, "-");
+  assert.equal(ghost.status, "?");
+});
+test("malformed JSON → null; non-array → null (never throws)", () => {
+  assert.equal(parseToolsJson("not json"), null);
+  assert.equal(parseToolsJson("{"), null);
+  assert.equal(parseToolsJson('{"a":1}'), null);
+});
+
 // ─── render: matrix tab ────────────────────────────────────────────────────
 
 console.log("=== dashboard: renderDashboardLines (matrix tab) ===");
 test("renders title, detected-state header, tab strip, footer hints", () => {
-  const rows = parseMatrixNumeric(FIXTURE_MATRIX);
-  const text = renderDashboardLines(bareState(), "matrix", rows, id).join("\n");
+  const text = renderDashboardLines(bareState(), "matrix", dashData({ matrix: parseMatrixNumeric(FIXTURE_MATRIX) }), id).join("\n");
   assert.match(text, /repository-harness · dashboard/);
   assert.match(text, /cli 0\.1\.11/);
   assert.match(text, /db ok/);
@@ -120,8 +225,7 @@ test("renders title, detected-state header, tab strip, footer hints", () => {
   assert.match(text, /\[1-4\] tabs.*\[r\] refresh.*\[Esc\] close/);
 });
 test("matrix tab lists every story row with status + id", () => {
-  const rows = parseMatrixNumeric(FIXTURE_MATRIX);
-  const text = renderDashboardLines(bareState(), "matrix", rows, id).join("\n");
+  const text = renderDashboardLines(bareState(), "matrix", dashData({ matrix: parseMatrixNumeric(FIXTURE_MATRIX) }), id).join("\n");
   assert.match(text, /US-001/);
   assert.match(text, /Auth login/);
   assert.match(text, /implemented/);
@@ -131,60 +235,145 @@ test("matrix tab lists every story row with status + id", () => {
   assert.match(text, /retired/);
 });
 test("empty matrix → dim empty-state row (no throw)", () => {
-  const text = renderDashboardLines(bareState(), "matrix", [], id).join("\n");
+  const text = renderDashboardLines(bareState(), "matrix", dashData(), id).join("\n");
   assert.match(text, /no stories/);
 });
 
-// ─── render: non-matrix tabs are honest placeholders ───────────────────────
+// ─── render: stats tab ─────────────────────────────────────────────────────
 
-console.log("=== dashboard: renderDashboardLines (placeholder tabs) ===");
-test("stats/backlog/tools tabs ship-in-US-011; timeline ships-in-P5", () => {
-  const tabs: DashboardTab[] = ["stats", "backlog", "tools", "timeline"];
-  for (const t of tabs) {
-    const text = renderDashboardLines(bareState(), t, [], id).join("\n");
-    const expect = t === "timeline" ? "P5" : "US-011";
-    assert.match(text, new RegExp(`${t} tab ships in ${expect}`), `${t} placeholder`);
-  }
+console.log("=== dashboard: renderDashboardLines (stats tab) ===");
+test("renders every count label + its value", () => {
+  const text = renderDashboardLines(bareState(), "stats", dashData({ stats: parseStats(FIXTURE_STATS)! }), id).join("\n");
+  assert.match(text, /intakes/);
+  assert.match(text, /stories/);
+  assert.match(text, /decisions/);
+  assert.match(text, /backlog/);
+  assert.match(text, /traces/);
+  // values from FIXTURE_STATS
+  for (const v of ["12", "4", "17"]) assert.match(text, new RegExp(`\\b${v}\\b`), `value ${v}`);
+});
+test("stats fetch error → dim error row, no counts", () => {
+  const text = renderDashboardLines(bareState(), "stats", dashData({ errors: { stats: "stats" } }), id).join("\n");
+  assert.match(text, /stats unavailable/);
+  assert.doesNotMatch(text, /intakes/);
+});
+
+// ─── render: backlog tab ───────────────────────────────────────────────────
+
+console.log("=== dashboard: renderDashboardLines (backlog tab) ===");
+test("renders every open backlog row with status + risk", () => {
+  const text = renderDashboardLines(bareState(), "backlog", dashData({ backlog: parseBacklogOpen(FIXTURE_BACKLOG) }), id).join("\n");
+  assert.match(text, /markdown<->durable/);
+  assert.match(text, /proposed/);
+  assert.match(text, /tiny/);
+  assert.match(text, /Gate B'/);
+  assert.match(text, /implemented/);
+});
+test("empty backlog → dim empty-state row", () => {
+  const text = renderDashboardLines(bareState(), "backlog", dashData(), id).join("\n");
+  assert.match(text, /no open backlog items/);
+});
+test("backlog fetch error → dim error row", () => {
+  const text = renderDashboardLines(bareState(), "backlog", dashData({ errors: { backlog: "backlog" } }), id).join("\n");
+  assert.match(text, /backlog unavailable/);
+});
+
+// ─── render: tools tab ─────────────────────────────────────────────────────
+
+console.log("=== dashboard: renderDashboardLines (tools tab) ===");
+test("renders every tool with ✓ for present and · for absent", () => {
+  const rows = parseToolsJson(FIXTURE_TOOLS_JSON)!;
+  const text = renderDashboardLines(bareState(), "tools", dashData({ tools: rows }), id).join("\n");
+  assert.match(text, /init/);
+  assert.match(text, /query matrix/);
+  assert.match(text, /Task state/);
+  // present tools render ✓; the absent 'eslint' still lists its name
+  assert.match(text, /eslint/);
+});
+test("empty tools → dim empty-state row", () => {
+  const text = renderDashboardLines(bareState(), "tools", dashData(), id).join("\n");
+  assert.match(text, /no tools registered/);
+});
+test("tools fetch error → dim error row", () => {
+  const text = renderDashboardLines(bareState(), "tools", dashData({ errors: { tools: "tools" } }), id).join("\n");
+  assert.match(text, /tools unavailable/);
+});
+
+// ─── render: timeline is still the honest P5 placeholder ───────────────────
+
+console.log("=== dashboard: renderDashboardLines (timeline placeholder) ===");
+test("timeline tab still ships-in-P5 placeholder", () => {
+  const text = renderDashboardLines(bareState(), "timeline", dashData(), id).join("\n");
+  assert.match(text, /timeline tab ships in P5/);
 });
 
 // ─── render: box-width alignment ───────────────────────────────────────────
 
 console.log("=== dashboard: box-width alignment ===");
-test("every rendered line is exactly the box width (74 inner / 76 outer)", () => {
-  const rows = parseMatrixNumeric(FIXTURE_MATRIX);
+const fullData = dashData({
+  matrix: parseMatrixNumeric(FIXTURE_MATRIX),
+  stats: parseStats(FIXTURE_STATS)!,
+  backlog: parseBacklogOpen(FIXTURE_BACKLOG),
+  tools: parseToolsJson(FIXTURE_TOOLS_JSON)!,
+});
+test("every rendered line is exactly the box width (76 outer) on every tab", () => {
   for (const tab of ["matrix", "stats", "backlog", "tools", "timeline"] as DashboardTab[]) {
-    const lines = renderDashboardLines(bareState(), tab, rows, id, 76);
+    const lines = renderDashboardLines(bareState(), tab, fullData, id, 76);
     for (const ln of lines) {
       assert.equal(ansiVisibleWidth(ln), 76, `${tab}: line not 76 cols: ${JSON.stringify(ln)}`);
     }
   }
 });
-test("alignment holds at the narrower floor width (60)", () => {
-  const rows = parseMatrixNumeric(FIXTURE_MATRIX);
-  const lines = renderDashboardLines(bareState(), "matrix", rows, id, 60);
-  for (const ln of lines) {
-    assert.equal(ansiVisibleWidth(ln), 60, `line not 60 cols: ${JSON.stringify(ln)}`);
+test("alignment holds at the narrower floor width (60) on every tab", () => {
+  for (const tab of ["matrix", "stats", "backlog", "tools"] as DashboardTab[]) {
+    const lines = renderDashboardLines(bareState(), tab, fullData, id, 60);
+    for (const ln of lines) {
+      assert.equal(ansiVisibleWidth(ln), 60, `${tab}: line not 60 cols: ${JSON.stringify(ln)}`);
+    }
   }
 });
 
 // ─── Approach B: wiring through the REAL index.ts ──────────────────────────
 
-console.log("=== wiring: /harness → DASHBOARD route + matrix fetch ===");
+console.log("=== wiring: /harness → DASHBOARD route + triplet fetch ===");
 
 /** A realistic `query matrix --numeric` body for the wired exec mock. */
 const WIRED_MATRIX =
   "US-001  P1 detect + footer      implemented  1  1  0  0\n" +
   "US-010  P4 dashboard shell      planned      0  0  0  0\n";
+const WIRED_STATS =
+  "=== Harness Stats ===\n" +
+  "intakes  stories  decisions  backlog_items  traces\n" +
+  "-------  -------  ---------  -------------  ------\n" +
+  "2        2        0          0              1    \n";
+const WIRED_BACKLOG =
+  "id  title                       status     risk  predicted_impact\n" +
+  "--  --------------------------  ---------  ----  ----------------\n" +
+  "2   markdown drift cross-check  proposed   tiny  makes drift visible\n";
+const WIRED_TOOLS_JSON = JSON.stringify([
+  { name: "init", kind: "builtin", responsibility: "Task state", status: "present" },
+  { name: "query matrix", kind: "builtin", responsibility: "Task state", status: "present" },
+]);
 
 /**
  * Mock ExtensionAPI + ctx. `keySeqs[i]` is the key sequence driven on the i-th
  * `ctx.ui.custom` call; after each non-closing key the component is re-rendered
- * into `renders` so tests can assert tab switches. `matrixCode`/`matrixStdout`
- * model a failing query for the degradation test.
+ * into `renders` so tests can assert tab switches. Per-query stdout/code model
+ * a failing query for the degradation tests.
  */
 function mockHarness(
   cwd: string,
-  opts: { keySeqs?: string[][]; matrixStdout?: string; matrixCode?: number } = {}
+  opts: {
+    keySeqs?: string[][];
+    matrixStdout?: string;
+    matrixCode?: number;
+    statsStdout?: string;
+    statsCode?: number;
+    backlogStdout?: string;
+    backlogCode?: number;
+    toolsStdout?: string;
+    toolsCode?: number;
+  } = {}
 ) {
   const matrixStdout = opts.matrixStdout ?? WIRED_MATRIX;
   const matrixCode = opts.matrixCode ?? 0;
@@ -205,13 +394,15 @@ function mockHarness(
       execCalls.push({ cmd, args });
       if (args[0] === "--version")
         return { stdout: "harness-cli 0.1.11\n", stderr: "", code: 0, killed: false };
-      if (args[0] === "query" && args[1] === "stats")
-        return {
-          stdout: "intakes  stories  decisions  backlog_items  traces\n2        2        0          0              1\n",
-          stderr: "",
-          code: 0,
-          killed: false,
-        };
+      if (args[0] === "query" && args[1] === "stats") {
+        return { stdout: opts.statsStdout ?? WIRED_STATS, stderr: "", code: opts.statsCode ?? 0, killed: false };
+      }
+      if (args[0] === "query" && args[1] === "backlog") {
+        return { stdout: opts.backlogStdout ?? WIRED_BACKLOG, stderr: "", code: opts.backlogCode ?? 0, killed: false };
+      }
+      if (args[0] === "query" && args[1] === "tools") {
+        return { stdout: opts.toolsStdout ?? WIRED_TOOLS_JSON, stderr: "", code: opts.toolsCode ?? 0, killed: false };
+      }
       if (args[0] === "query" && args[1] === "matrix") {
         state.matrixCalls++;
         return { stdout: matrixStdout, stderr: "", code: matrixCode, killed: false };
@@ -267,7 +458,7 @@ function installedRepo(): string {
   return cwd;
 }
 
-test("installed+db → DASHBOARD route: fetches query matrix --numeric, no installer", async () => {
+test("installed+db → DASHBOARD route: fetches matrix/stats/backlog/tools, no installer", async () => {
   const mod = await import("../extensions/harness/index.ts");
   const cwd = installedRepo();
   try {
@@ -277,10 +468,12 @@ test("installed+db → DASHBOARD route: fetches query matrix --numeric, no insta
 
     assert.equal(state.customCalls, 1, "dashboard overlay opens exactly once");
     assert.equal(state.matrixCalls, 1, "fetchMatrix runs query matrix --numeric once");
-    assert.ok(
-      execCalls.some((c) => c.args[0] === "query" && c.args[1] === "matrix" && c.args[2] === "--numeric"),
-      "must exec `query matrix --numeric`"
-    );
+    for (const sub of ["matrix", "stats", "backlog", "tools"] as const) {
+      assert.ok(
+        execCalls.some((c) => c.args[0] === "query" && c.args[1] === sub),
+        `must exec query ${sub} (triplet)`
+      );
+    }
     assert.ok(
       !execCalls.some((c) => c.args[0] === "-c" && /curl/.test((c.args[1] ?? ""))),
       "installer must NOT run on the dashboard route"
@@ -294,30 +487,32 @@ test("installed+db → DASHBOARD route: fetches query matrix --numeric, no insta
   }
 });
 
-test("tab switch: '2' re-renders the stats placeholder; '1' returns to matrix", async () => {
+test("tab switch: '2' stats content; '3' backlog content; '4' tools content; '1' back to matrix", async () => {
   const mod = await import("../extensions/harness/index.ts");
   const cwd = installedRepo();
   try {
     const { pi, ctx, state, registeredCommands } = mockHarness(cwd, {
-      keySeqs: [["2", "1", "\u001b"]],
+      keySeqs: [["2", "3", "4", "1", "\u001b"]],
     });
     mod.default(pi as never);
     await registeredCommands.get("harness")!("", ctx as never);
 
     const renders = state.renders[0]!;
     assert.match(renders[0]!, /US-001/, "initial render = matrix tab");
-    assert.match(renders[1]!, /stats tab ships in US-011/, "after '2' = stats placeholder");
-    assert.match(renders[2]!, /US-001/, "after '1' = back to matrix");
+    assert.match(renders[1]!, /intakes/, "after '2' = stats tab content");
+    assert.match(renders[2]!, /markdown drift/, "after '3' = backlog tab content");
+    assert.match(renders[3]!, /init/, "after '4' = tools tab content");
+    assert.match(renders[4]!, /US-001/, "after '1' = back to matrix");
   } finally {
     rmSync(cwd, { recursive: true, force: true });
   }
 });
 
-test("refresh loop: 'r' re-fetches matrix and re-opens the overlay", async () => {
+test("refresh loop: 'r' re-fetches all tabs and re-opens the overlay", async () => {
   const mod = await import("../extensions/harness/index.ts");
   const cwd = installedRepo();
   try {
-    const { pi, ctx, state, registeredCommands } = mockHarness(cwd, {
+    const { pi, ctx, execCalls, state, registeredCommands } = mockHarness(cwd, {
       keySeqs: [["r"], ["\u001b"]],
     });
     mod.default(pi as never);
@@ -325,6 +520,13 @@ test("refresh loop: 'r' re-fetches matrix and re-opens the overlay", async () =>
 
     assert.equal(state.customCalls, 2, "overlay re-opens once per refresh");
     assert.equal(state.matrixCalls, 2, "matrix is re-fetched on each refresh");
+    // each dashboard tab query is re-fetched on both opens. (detect() also runs a
+    // cached `query stats` for the footer counts — that is the +1 over 4×2 — so
+    // assert per-subcommand rather than on the raw total.)
+    for (const sub of ["matrix", "stats", "backlog", "tools"] as const) {
+      const n = execCalls.filter((c) => c.args[0] === "query" && c.args[1] === sub).length;
+      assert.ok(n >= 2, `query ${sub} fetched on each open (>=2); got ${n}`);
+    }
   } finally {
     rmSync(cwd, { recursive: true, force: true });
   }
@@ -343,7 +545,7 @@ test("Esc closes the dashboard overlay", async () => {
   }
 });
 
-test("failing query (exit 1) → empty matrix, dim empty-state, no throw", async () => {
+test("failing matrix query (exit 1) → empty matrix, dim empty-state, no throw", async () => {
   const mod = await import("../extensions/harness/index.ts");
   const cwd = installedRepo();
   try {
@@ -353,9 +555,62 @@ test("failing query (exit 1) → empty matrix, dim empty-state, no throw", async
       keySeqs: [["\u001b"]],
     });
     mod.default(pi as never);
-    // must not throw
+    await registeredCommands.get("harness")!("", ctx as never); // must not throw
+    assert.match(state.renders[0]![0]!, /no stories/, "matrix degrades to empty-state row");
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("failing stats query → stats tab shows a dim error row, never throws", async () => {
+  const mod = await import("../extensions/harness/index.ts");
+  const cwd = installedRepo();
+  try {
+    const { pi, ctx, state, registeredCommands } = mockHarness(cwd, {
+      statsStdout: "",
+      statsCode: 1,
+      keySeqs: [["2", "\u001b"]],
+    });
+    mod.default(pi as never);
+    await registeredCommands.get("harness")!("", ctx as never); // must not throw
+    const statsRender = state.renders[0]![1]!;
+    assert.match(statsRender, /stats unavailable/, "stats tab degrades to error row");
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("failing tools query (bad JSON) → tools tab shows a dim error row", async () => {
+  const mod = await import("../extensions/harness/index.ts");
+  const cwd = installedRepo();
+  try {
+    const { pi, ctx, state, registeredCommands } = mockHarness(cwd, {
+      toolsStdout: "not json at all",
+      toolsCode: 0,
+      keySeqs: [["4", "\u001b"]],
+    });
+    mod.default(pi as never);
     await registeredCommands.get("harness")!("", ctx as never);
-    assert.match(state.renders[0]![0]!, /no stories/, "degrades to empty-state row");
+    const toolsRender = state.renders[0]![1]!;
+    assert.match(toolsRender, /tools unavailable/, "tools tab degrades to error row on bad JSON");
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("failing backlog query (exit 1) → backlog tab shows a dim error row, never throws", async () => {
+  const mod = await import("../extensions/harness/index.ts");
+  const cwd = installedRepo();
+  try {
+    const { pi, ctx, state, registeredCommands } = mockHarness(cwd, {
+      backlogStdout: "",
+      backlogCode: 1,
+      keySeqs: [["3", "\u001b"]],
+    });
+    mod.default(pi as never);
+    await registeredCommands.get("harness")!("", ctx as never); // must not throw
+    const backlogRender = state.renders[0]![1]!;
+    assert.match(backlogRender, /backlog unavailable/, "backlog tab degrades to error row");
   } finally {
     rmSync(cwd, { recursive: true, force: true });
   }

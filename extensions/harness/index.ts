@@ -58,9 +58,17 @@ import {
 } from "./overlay.js";
 import {
   parseMatrixNumeric,
+  parseStats,
+  parseBacklogOpen,
+  parseToolsJson,
   renderDashboardLines,
+  type DashboardData,
   type DashboardTab,
   type MatrixRow,
+  type StatsCounts,
+  type BacklogRow,
+  type ToolRow,
+  ZERO_STATS,
 } from "./dashboard.js";
 
 const STATUS_KEY = "harness";
@@ -239,8 +247,8 @@ interface HarnessOverlayOpts {
   onDone: (result: HarnessOverlayResult) => void;
   /** DASHBOARD only: active tab. Defaults to "matrix". */
   tab?: DashboardTab;
-  /** DASHBOARD only: parsed `query matrix --numeric` rows. */
-  matrix?: MatrixRow[];
+  /** DASHBOARD only: parsed tab data (matrix + stats + backlog + tools + errors). */
+  data?: DashboardData;
 }
 
 /**
@@ -259,7 +267,7 @@ class HarnessOverlayComponent {
   private readonly fg: FgFn;
   private readonly onDone: (result: HarnessOverlayResult) => void;
   private tab: DashboardTab;
-  private matrix: MatrixRow[];
+  private data: DashboardData;
 
   constructor(o: HarnessOverlayOpts) {
     this.view = o.view;
@@ -268,7 +276,7 @@ class HarnessOverlayComponent {
     this.fg = o.fg;
     this.onDone = o.onDone;
     this.tab = o.tab ?? "matrix";
-    this.matrix = o.matrix ?? [];
+    this.data = o.data ?? { matrix: [], stats: ZERO_STATS, backlog: [], tools: [], errors: {} };
   }
 
   handleInput(data: string): void {
@@ -308,7 +316,7 @@ class HarnessOverlayComponent {
       const plan = buildInstallPlan(this.flags, { cwd: this.state.cwd });
       return renderInstallLines(this.state, this.flags, plan, this.fg, width);
     }
-    return renderDashboardLines(this.state, this.tab, this.matrix, this.fg, width);
+    return renderDashboardLines(this.state, this.tab, this.data, this.fg, width);
   }
 
   invalidate(): void {
@@ -389,6 +397,91 @@ async function fetchMatrix(
   }
 }
 
+/** Fetch + parse `query stats`. Returns null on any failure (caller records an
+ *  error so the stats tab degrades to a dim error row, never throws). */
+async function fetchStatsCounts(
+  pi: ExtensionAPI,
+  ctx: ExtensionCommandContext
+): Promise<StatsCounts | null> {
+  try {
+    const bin = cliBinaryPath(ctx.cwd);
+    const res = await pi.exec(bin, ["query", "stats"], {
+      cwd: ctx.cwd,
+      signal: ctx.signal,
+      timeout: 5_000,
+    });
+    if (res.code !== 0) return null;
+    return parseStats(res.stdout);
+  } catch {
+    return null;
+  }
+}
+
+/** Fetch + parse `query backlog --open`. Returns null on failure (distinct from
+ *  a valid empty `[]` → "no open backlog items"). */
+async function fetchBacklogRows(
+  pi: ExtensionAPI,
+  ctx: ExtensionCommandContext
+): Promise<BacklogRow[] | null> {
+  try {
+    const bin = cliBinaryPath(ctx.cwd);
+    const res = await pi.exec(bin, ["query", "backlog", "--open"], {
+      cwd: ctx.cwd,
+      signal: ctx.signal,
+      timeout: 5_000,
+    });
+    if (res.code !== 0) return null;
+    return parseBacklogOpen(res.stdout);
+  } catch {
+    return null;
+  }
+}
+
+/** Fetch + parse `query tools --json` (native JSON). Returns null on failure. */
+async function fetchToolRows(
+  pi: ExtensionAPI,
+  ctx: ExtensionCommandContext
+): Promise<ToolRow[] | null> {
+  try {
+    const bin = cliBinaryPath(ctx.cwd);
+    const res = await pi.exec(bin, ["query", "tools", "--json"], {
+      cwd: ctx.cwd,
+      signal: ctx.signal,
+      timeout: 5_000,
+    });
+    if (res.code !== 0) return null;
+    return parseToolsJson(res.stdout);
+  } catch {
+    return null;
+  }
+}
+
+/** Fetch all DASHBOARD tab data in parallel and build the DashboardData the
+ *  renderer consumes. A null result on a tab records an error so that tab
+ *  renders a dim error row; `matrix` keeps US-010's empty-on-failure shape. */
+async function fetchDashboardData(
+  pi: ExtensionAPI,
+  ctx: ExtensionCommandContext
+): Promise<DashboardData> {
+  const [matrix, stats, backlog, tools] = await Promise.all([
+    fetchMatrix(pi, ctx),
+    fetchStatsCounts(pi, ctx),
+    fetchBacklogRows(pi, ctx),
+    fetchToolRows(pi, ctx),
+  ]);
+  const errors: Partial<Record<DashboardTab, string>> = {};
+  if (stats === null) errors.stats = "stats";
+  if (backlog === null) errors.backlog = "backlog";
+  if (tools === null) errors.tools = "tools";
+  return {
+    matrix,
+    stats: stats ?? ZERO_STATS,
+    backlog: backlog ?? [],
+    tools: tools ?? [],
+    errors,
+  };
+}
+
 /** The /harness command handler: route → overlay → (on confirm) run + refresh. */
 async function handleHarnessCommand(
   pi: ExtensionAPI,
@@ -427,15 +520,15 @@ async function handleHarnessCommand(
   const fg: FgFn = (c, t) => theme.fg(c as never, t);
   const flags: InstallFlags = { ...DEFAULT_FLAGS, mode: initialMode(state) };
 
-  // DASHBOARD: fetch the proof matrix, open the overlay, and loop on refresh
+  // DASHBOARD: fetch all tab data, open the overlay, and loop on refresh
   // (re-fetch + re-open). INSTALL: single overlay, then runInstallPlan.
   if (view === "dashboard") {
     let result: HarnessOverlayResult;
     do {
-      const matrix = await fetchMatrix(pi, ctx);
+      const data = await fetchDashboardData(pi, ctx);
       result = await ctx.ui.custom<HarnessOverlayResult>(
         (_tui, _theme, _kb, done) =>
-          new HarnessOverlayComponent({ view, state, flags, fg, onDone: done, matrix }),
+          new HarnessOverlayComponent({ view, state, flags, fg, onDone: done, data }),
         { overlay: true, overlayOptions: { width: "76%", margin: 2 } }
       );
     } while (result.action === "refresh");
