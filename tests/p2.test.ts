@@ -6,6 +6,9 @@
 // readFile/readDir fixtures; gates get plain state/session objects.
 
 import assert from "node:assert/strict";
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
   decideGateA,
   gateIntake,
@@ -14,6 +17,7 @@ import {
   isHarnessIntakeCall,
   isHarnessTraceCall,
   isMutationToolCall,
+  parseCommandLeads,
 } from "../extensions/harness/gates.ts";
 import {
   parseMatrix,
@@ -63,6 +67,37 @@ test("does not match unrelated", () => {
 });
 test("undefined command is false", () => {
   assert.equal(isHarnessCliCall(undefined), false);
+});
+
+console.log("=== gates: argv parsing (no substring false positives) ===");
+test("echo mentioning harness-cli is NOT a call", () => {
+  assert.equal(isHarnessCliCall('echo "harness-cli trace"'), false);
+  assert.equal(isHarnessTraceCall('echo "harness-cli trace"'), false);
+});
+test("grep over harness-cli.md is NOT a call", () => {
+  assert.equal(isHarnessCliCall("grep trace path/harness-cli.md"), false);
+});
+test("env-prefixed real invocation IS a call", () => {
+  assert.equal(isHarnessCliCall("FOO=bar harness-cli query matrix"), true);
+});
+test("compound script: trace detected as a real segment", () => {
+  assert.equal(
+    isHarnessTraceCall("git commit -m x && ./scripts/bin/harness-cli trace --summary y"),
+    true
+  );
+});
+test("compound script: intake detected as a real segment", () => {
+  assert.equal(
+    isHarnessIntakeCall("echo hi; harness-cli intake --type spec_slice"),
+    true
+  );
+});
+test("cat of a harness-cli-notes file is NOT a call", () => {
+  assert.equal(isHarnessCliCall("cat harness-cli-notes.txt"), false);
+});
+test("parseCommandLeads splits segments", () => {
+  const leads = parseCommandLeads("a=b git commit && echo hi || harness-cli trace");
+  assert.deepEqual(leads, ["git", "echo", "harness-cli"]);
 });
 
 console.log("=== gates: intake/trace/mutation classifiers ===");
@@ -292,6 +327,93 @@ test("refreshFromCounts clears on count increase", () => {
 test("trace gate has no grace window (always starts uncleared)", () => {
   seedSession("/t4", 5, 3, Date.now() - 1000);
   assert.equal(getSession("/t4").traceRecorded, false);
+});
+
+// ─── Approach B: wiring test through the REAL index.ts ─────────────────────
+//
+// Load the actual extension default export, feed it a mock ExtensionAPI that
+// captures pi.on() handler registrations, then replay synthetic session_start /
+// tool_call / tool_result events through the REAL handlers against a fixture
+// repo on disk. This is the layer between unit (stubbed everything) and a live
+// agent (LLM): deterministic, free, and it exercises the index.ts wiring +
+// detect/drift/session modules end-to-end. Catches the stale-cache +
+// over-block class of bugs that manual dogfood found.
+
+console.log("=== wiring: index.ts gate lifecycle (Approach B) ===");
+
+test("full gate lifecycle: intake block -> clear -> drift block -> clear", async () => {
+  // dynamically import the compiled-runnable extension (default export)
+  const mod = await import("../extensions/harness/index.ts");
+  const setup = mod.default;
+
+  // fixture repo on disk
+  const cwd = mkdtempSync(join(tmpdir(), "harness-wiring-"));
+  mkdirSync(join(cwd, "scripts", "bin"), { recursive: true });
+  writeFileSync(join(cwd, "scripts", "bin", "harness-cli"), "#!/bin/sh\n"); // dummy presence
+  writeFileSync(join(cwd, "harness.db"), ""); // dummy presence
+  mkdirSync(join(cwd, "docs", "stories"), { recursive: true });
+  writeFileSync(
+    join(cwd, "docs", "stories", "US-001-foo.md"),
+    "# US-001\n\n## Status\n\nimplemented\n\n## Evidence\n\n- proof\n"
+  );
+  // US-002: markdown says in_progress but durable (matrix) will say implemented => drift
+  const driftedPacket = join(cwd, "docs", "stories", "US-002-bar.md");
+  writeFileSync(driftedPacket, "# US-002\n\n## Status\n\nin_progress\n\n## Evidence\n\n- proof\n");
+  const matrixOut = () => "US-001  foo  implemented\nUS-002  bar  implemented\n";
+
+  try {
+    // mock ExtensionAPI: capture handlers + canned exec
+    const handlers = new Map<string, (e: Record<string, unknown>, ctx: Record<string, unknown>) => unknown>();
+    const pi = {
+      on(event: string, handler: (e: unknown, ctx: unknown) => unknown) {
+        handlers.set(event, handler as never);
+      },
+      async exec(_cmd: string, args: string[]) {
+        if (args[0] === "--version") return { stdout: "harness-cli 0.1.11\n", stderr: "", code: 0, killed: false };
+        if (args[0] === "query" && args[1] === "stats")
+          return { stdout: "intakes  stories  decisions  backlog_items  traces\n1        2        0          0              0\n", stderr: "", code: 0, killed: false };
+        if (args[0] === "query" && args[1] === "matrix") return { stdout: matrixOut(), stderr: "", code: 0, killed: false };
+        // old intake => outside grace window => intake gate starts armed
+        if (args[0] === "query" && args[1] === "intakes")
+          return { stdout: "id  created_at\n1   2020-01-01 00:00:00\n", stderr: "", code: 0, killed: false };
+        return { stdout: "", stderr: "", code: 1, killed: false };
+      },
+    };
+    setup(pi as never);
+
+    const ctx = { cwd, signal: undefined, hasUI: false, ui: {} } as never;
+    const tc = (e: Record<string, unknown>) => handlers.get("tool_call")!(e, ctx);
+    const tr = (e: Record<string, unknown>) => handlers.get("tool_result")!(e, ctx);
+
+    // session_start seeds baselines (intake old => armed)
+    await handlers.get("session_start")!({}, ctx);
+
+    // 1. Gate A: write BLOCKED pre-intake
+    let d: { block?: boolean; reason?: string } | undefined =
+      (await tc({ toolName: "write", input: { path: "x.ts" } })) as { block?: boolean } | undefined;
+    assert.equal(d?.block, true, "write must block before intake");
+
+    // 2. intake tool_result clears the gate
+    await tr({ toolName: "bash", input: { command: "harness-cli intake --type spec_slice" }, isError: false });
+
+    // 3. write now PASSES
+    d = (await tc({ toolName: "write", input: { path: "x.ts" } })) as { block?: boolean } | undefined;
+    assert.equal(d?.block ?? false, false, "write must pass after intake");
+
+    // 4. Gate B': trace BLOCKED while US-002 drifts
+    d = (await tc({ toolName: "bash", input: { command: "harness-cli trace --summary x" } })) as { block?: boolean; reason?: string } | undefined;
+    assert.equal(d?.block, true, "trace must block while drift exists");
+    assert.match(d?.reason ?? "", /drift gate/);
+
+    // 5. fix the drift on disk (status -> implemented matches durable)
+    writeFileSync(driftedPacket, "# US-002\n\n## Status\n\nimplemented\n\n## Evidence\n\n- proof\n");
+
+    // 6. trace now PASSES (gateDriftOnTrace always fresh)
+    d = (await tc({ toolName: "bash", input: { command: "harness-cli trace --summary x" } })) as { block?: boolean } | undefined;
+    assert.equal(d?.block ?? false, false, "trace must pass once drift cleared");
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
 });
 
 void run();

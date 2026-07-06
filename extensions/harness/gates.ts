@@ -45,47 +45,91 @@ export interface ToolInput {
 /** Tools that mutate files and are therefore subject to Gate A (narrow scope). */
 const MUTATION_TOOLS = new Set(["write", "edit"]);
 
+// ─── shell command parsing (argv-based, not substring grep) ───────────────
+//
+// Earlier versions grepped the WHOLE bash string for `harness-cli` + a
+// subcommand word. That over-matched: `echo "harness-cli trace"` or
+// `grep trace harness-cli.md` were treated as real invocations. We now split
+// the script on shell sequencing operators and inspect the LEADING token of
+// each segment, so only actual commands count.
+
+const SEGMENT_SPLIT = /\s*(?:&&|\|\||;|\||\n)\s*/;
+const HARNESS_BIN_RE = /^harness-cli(?:\.real|\.exe)?$/;
+
+/** Strip a leading `VAR=value` env assignment (possibly several). */
+function stripEnvPrefix(s: string): string {
+  let out = s;
+  while (/^[A-Za-z_][A-Za-z0-9_]*=\S+\s+/.test(out)) {
+    out = out.replace(/^[A-Za-z_][A-Za-z0-9_]*=\S+\s+/, "");
+  }
+  return out;
+}
+
+/** Basename of a path-like token (everything after the last `/`). */
+function basenameOf(token: string): string {
+  const i = token.lastIndexOf("/");
+  return i >= 0 ? token.slice(i + 1) : token;
+}
+
 /**
- * Does a bash command string invoke the harness CLI (read/query/init/intake/
- * trace/...)? Used to exempt harness-cli itself from gating and to detect
- * intake/trace calls in tool_result.
- *
- * Matches:  ./scripts/bin/harness-cli ...  |  harness-cli ...   (with .real/.exe too)
- * Does NOT match: `harness-cli-notes.txt` (a different token).
+ * Leading command token of one shell segment, after stripping leading
+ * env-var assignments. Returns null for empty/comment segments.
+ */
+export function segmentLead(segment: string): string | null {
+  let s = segment.trim();
+  if (!s || s.startsWith("#")) return null;
+  s = stripEnvPrefix(s);
+  // first whitespace-delimited token, tolerating a leading quote
+  const m = s.match(/^("?)([^\s"']+)\1/);
+  return m ? m[2]! : null;
+}
+
+/**
+ * Split a bash script into the leading command token of each segment
+ * (separated by `&&`, `||`, `;`, `|`, or newlines). Exported for unit tests.
+ */
+export function parseCommandLeads(script: string): string[] {
+  const leads: string[] = [];
+  for (const seg of script.split(SEGMENT_SPLIT)) {
+    const lead = segmentLead(seg);
+    if (lead) leads.push(lead);
+  }
+  return leads;
+}
+
+/**
+ * Does the script INVOKE harness-cli as a command (not merely mention it in
+ * an echo/grep argument)? Tolerates path prefixes and `.real`/`.exe` suffixes.
  */
 export function isHarnessCliCall(command: string | undefined): boolean {
   if (!command) return false;
-  // Word-boundary match on the binary basename, tolerating path prefixes,
-  // the observer's `.real` suffix, and the Windows `.exe` suffix.
-  // The binary is always followed by whitespace, a `.real`/`.exe` suffix, or
-  // end-of-string. We require that so `harness-cli-notes.txt` does NOT match
-  // (a `-word` tail means it is a different token).
-  return /(^|[\s/])harness-cli(?:\.real|\.exe)?(?:\s|$)/.test(command);
+  return parseCommandLeads(command).some((t) => HARNESS_BIN_RE.test(basenameOf(t)));
 }
 
-/** Is this a `harness-cli ... intake ...` invocation? */
+/** Iterate harness-cli-invoking segments of a script. */
+function harnessCliSegments(command: string): string[] {
+  return command
+    .split(SEGMENT_SPLIT)
+    .filter((seg) => {
+      const lead = segmentLead(seg);
+      return lead != null && HARNESS_BIN_RE.test(basenameOf(lead));
+    });
+}
+
+/** Is this a `harness-cli ... intake ...` invocation (as a real command)? */
 export function isHarnessIntakeCall(command: string | undefined): boolean {
-  return (
-    isHarnessCliCall(command) &&
-    /\bintake\b/.test(command ?? "")
-  );
+  if (!command) return false;
+  return harnessCliSegments(command).some((seg) => /\bintake\b/.test(seg));
 }
 
 /** Is this a `harness-cli ... trace ...` invocation (the "done" step)? */
 export function isHarnessTraceCall(command: string | undefined): boolean {
-  return (
-    isHarnessCliCall(command) &&
-    /\btrace\b/.test(command ?? "")
-  );
+  if (!command) return false;
+  return harnessCliSegments(command).some((seg) => /\btrace\b/.test(seg));
 }
 
 /**
- * Does a bash command string invoke the harness CLI (read/query/init/intake/
- * trace/...)? Used to exempt harness-cli itself from gating and to detect
- * intake/trace calls in tool_result.
- *
- * Matches:  ./scripts/bin/harness-cli ...  |  harness-cli ...   (with .real/.exe too)
- * Does NOT match: `harness-cli-notes.txt` (a different token).
+ * Does this tool_call mutate files (Gate A narrow scope)?
  */
 export function isMutationToolCall(toolName: string): boolean {
   return MUTATION_TOOLS.has(toolName);

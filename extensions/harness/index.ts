@@ -146,7 +146,10 @@ async function gateDriftOnTrace(
       `Repository-harness drift gate (B′): the durable story table and the ` +
       `docs/stories/*.md packets disagree (${count} drift[s]: ${ids}). ` +
       `Sync the packet(s), then close. \`harness-cli audit\` cannot see this — ` +
-      `only this gate can. (status_mismatch / orphan_markdown / orphan_durable / missing_evidence)`,
+      `only this gate can. (status_mismatch / orphan_markdown / orphan_durable / missing_evidence) ` +
+      `Note: this gate inspects the whole bash script, so if the closing step ` +
+      `is bundled with sibling commands they are blocked too — run your other ` +
+      `commands first, clear the drift, then re-run the closing step alone.`,
   };
 }
 
