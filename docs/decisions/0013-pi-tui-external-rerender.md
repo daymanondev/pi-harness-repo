@@ -4,12 +4,30 @@ Date: 2026-07-07
 
 ## Status
 
-**Accepted on the re-render seam; the live-tail file-watch is DISABLED
-(unresolved).** Revised twice same-day after dogfooding (see §Revision). The
-OQ-4 conclusion — `TUI.requestRender()` is the external re-render lever, not
-`invalidate()` — stands as a source-level finding but is **not yet verified
-end-to-end in the real TUI**, because the file-watch primitive that would drive
-it froze the overlay before it could be exercised.
+**Superseded by retirement (2026-07-07).** US-016's live tail was **dropped**
+(intake #28, story US-016 → retired, backlog #7 → rejected) — see §Retirement.
+The original OQ-4 conclusion — `TUI.requestRender()` is the external re-render
+lever, not `invalidate()` — stands as a source-level finding, and the freeze
+investigation produced one durable correction: **the freeze is NOT the watch
+primitive.** A PTY-allocated probe proved `fs.watch` and `fs.watchFile` both
+stay healthy against pi's exact raw-stdin attachment, falsifying the Node #20148
+hypothesis below; the cause is pi-internal (the render loop). The historical
+§Revision / §Freeze text is retained for the record.
+
+## Retirement (2026-07-07)
+
+The live tail was retired rather than fixed. Rationale: the remaining root-cause
+work needs a real-TUI dogfood (the freeze is pi-internal — render path — and
+headless tests can't reproduce it), and the feature isn't needed now. Code
+removed from `extensions/harness/index.ts` (watcher, `refreshTimelineTail`,
+`degradeTimeline`, `dispose`, kill-switch, `tui` opt + the `watchFile`/
+`unwatchFile`/`Stats` imports); the US-015 TIMELINE tab + `readTimelineTail`
+stay. Investigation artifact: a PTY probe ran A/B/C across none / `fs.watch` /
+`fs.watchFile` under a real PTY replicating pi's `setRawMode+resume+on('data')`
+stdin — all three stayed healthy (stdin events continued after the handle was
+created), falsifying the Node #20148 primitive-conflict hypothesis and
+localising the freeze to `requestRender()` from an async callback. Any future
+re-enable must dogfood that path in the real TUI first.
 
 ## Revision history (2026-07-07)
 

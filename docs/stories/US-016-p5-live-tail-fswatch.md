@@ -2,13 +2,35 @@
 
 ## Status
 
-planned — **live tail DEFERRED.** The plumbing (`readTimelineTail`,
-`refreshTimelineTail`, the gated watcher, dispose) is implemented + tested, but
-the background file-watch is **DISABLED** (`LIVE_TAIL_ENABLED = false`) because
-it froze the TUI (see §Freeze). The overlay reverts to US-015 manual-`r`
-behavior, which the user confirmed works. Re-enable tracked as backlog #7. The
-headline AC ("appending a line surfaces the new row without manual refresh")
-is **not met** until the freeze root cause is isolated.
+retired — **live tail dropped (2026-07-07, intake #28).** The real-time
+file-watch tail was removed from the codebase (see §Retirement). A PTY-allocated
+probe proved the freeze is NOT the watch primitive — `fs.watch` and
+`fs.watchFile` both stayed healthy against pi's exact raw-stdin attachment
+(`setRawMode` + `resume` + `on('data')`, per `pi-tui/dist/terminal.js:80-150`) —
+so the cause is pi-internal (the render loop), which needs a real-TUI dogfood to
+isolate. Cost > benefit for a feature that isn't needed now, so it was retired
+rather than fixed. The US-015 TIMELINE tab + `readTimelineTail` stay (manual `r`
+refresh). Backlog #7 (freeze isolation) closed as **rejected**. See decision
+0013 §Retirement.
+
+## Retirement (2026-07-07)
+
+Removed from `extensions/harness/index.ts`: `LIVE_TAIL_ENABLED`,
+`startTimelineWatch`, `refreshTimelineTail`, `degradeTimeline`, `dispose`
+(watcher teardown), the `tui` opt/field, and the `watchFile`/`unwatchFile`/
+`Stats` imports. Removed the 3 live-tail wiring tests from `tests/p5.test.ts`
+(now 31, was 34); deleted the throwaway `scripts/debug/freeze-*` probes.
+`readTimelineTail` (dashboard.ts) + the US-015 TIMELINE tab + manual `r` refresh
+are unchanged. tsc clean; p2/p3/p4 no regression; lens 0 errors.
+
+**Durable finding from the investigation:** the freeze is pi-internal, not
+Node/libuv. The leading hypothesis in the original §Freeze (Node #20148 —
+FSEvents/kqueue conflicts with raw stdin) is **falsified** by the PTY probe
+(A/B/C across none/`fs.watch`/`fs.watchFile` under a real PTY: all three kept
+receiving stdin events after the handle was created). Whatever re-enables a
+background watcher must first survive a real-TUI dogfood of the render path
+(`requestRender()` from an async callback); the headless wiring tests cannot
+catch this class of regression (no real stdin).
 
 ## Lane
 

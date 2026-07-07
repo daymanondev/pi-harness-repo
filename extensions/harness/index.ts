@@ -26,7 +26,6 @@ import {
   type ExtensionCommandContext,
 } from "@earendil-works/pi-coding-agent";
 import { readFile, readdir, writeFile } from "node:fs/promises";
-import { watchFile, unwatchFile, type Stats } from "node:fs";
 import { join } from "node:path";
 import {
   cliBinaryPath,
@@ -79,20 +78,12 @@ import {
 
 const STATUS_KEY = "harness";
 
-// ── US-016 live-tail kill switch ────────────────────────────────────────────
-// The background file watcher is DISABLED. fs.watch confirmed froze the
-// /harness DASHBOARD in the real pi TUI (dogfooding); a `fs.watchFile` attempt
-// could not be cleanly verified (pi sessions may share a process, so a "new
-// session" can still run stale module code). Rather than ship either primitive
-// unverified, the watcher is off and the overlay reverts to the known-working
-// US-015 behavior (manual `r` refresh). Confirmed responsive via a diag log:
-// with the watcher off, MODULE_LOAD + ctor + key inputs all fire normally.
-//
-// The plumbing (readTimelineTail / refreshTimelineTail / startTimelineWatch /
-// dispose) is retained, gated behind this flag, for a safe re-enable once the
-// root cause — why ANY background file-watch wedges pi's raw-stdin overlay — is
-// isolated. See decision 0013 §Revision.
-const LIVE_TAIL_ENABLED = false;
+// ── US-016 live tail RETIRED (2026-07-07) ───────────────────────────────────
+// Removed: the real-time file-watch tail's freeze root cause is pi-internal
+// (the render loop, not the watch primitive — a PTY probe proved fs.watch /
+// fs.watchFile do NOT freeze raw stdin) and would need a real-TUI dogfood to
+// fix; the feature wasn't needed. The TIMELINE tab (US-015) stays, with
+// manual `r` refresh. Details: decision 0013 §Retirement + US-016 (retired).
 const WIDGET_KEY = "harness-hint";
 const FRICTION_WIDGET_KEY = "harness-friction";
 
@@ -306,11 +297,6 @@ interface HarnessOverlayOpts {
   tab?: DashboardTab;
   /** DASHBOARD only: parsed tab data (matrix + stats + backlog + tools + errors). */
   data?: DashboardData;
-  /** The pi-tui TUI instance, captured so the live-tail watcher (US-016) can
-   *  call `requestRender()` to re-pull `render()` from an `fs.watch` callback.
-   *  Typed structurally (not via the `TUI` import) to mirror how this file
-   *  treats the Component shape. Undefined in non-TUI tests / INSTALL view. */
-  tui?: { requestRender(force?: boolean): void };
 }
 
 /**
@@ -330,10 +316,6 @@ class HarnessOverlayComponent {
   private readonly onDone: (result: HarnessOverlayResult) => void;
   private nav: DashboardNav;
   private data: DashboardData;
-  /** The pi-tui TUI (for `requestRender()` from the live-tail watcher). */
-  private readonly tui?: { requestRender(force?: boolean): void };
-  /** fs.watchFile listener (US-016). Held so dispose() can unwatch precisely. */
-  private watchListener?: (curr: Stats, prev: Stats) => void;
 
   constructor(o: HarnessOverlayOpts) {
     this.view = o.view;
@@ -343,13 +325,6 @@ class HarnessOverlayComponent {
     this.onDone = o.onDone;
     this.nav = { tab: o.tab ?? "matrix", cursor: 0, drill: null };
     this.data = o.data ?? { matrix: [], stats: ZERO_STATS, backlog: [], tools: [], drift: [], timeline: [], packets: {}, errors: {} };
-    this.tui = o.tui;
-    // US-016: start the live tail as soon as the DASHBOARD opens (the watcher
-    // is cheap; it fires for any events.jsonl append regardless of active
-    // tab, and requestRender is debounced by the TUI). Skipped when the
-    // initial fetch already failed (no file → nothing to tail) or when no TUI
-    // is wired (tests).
-    if (this.view === "dashboard") this.startTimelineWatch();
   }
 
   handleInput(data: string): void {
@@ -391,96 +366,6 @@ class HarnessOverlayComponent {
 
   invalidate(): void {
     // no cached render state
-  }
-
-  // ── US-016: live tail (.harness-observer/events.jsonl) ───────────────────
-  //
-  // Two seams, resolved separately:
-  //  (1) Re-render from an external trigger (OQ-4, decision 0013): the pi-tui
-  //      Component contract DOES support it — `TUI.requestRender()` is public
-  //      and `ctx.ui.custom` hands the component the `tui`, so an async callback
-  //      re-derives the tail then calls `tui.requestRender()`; `compositeOverlays`
-  //      re-pulls `render(width)` fresh every pass. (`invalidate()` is NOT the
-  //      lever — it is what the TUI calls ON the component, e.g. on theme change.)
-  //  (2) The file-watch MECHANISM: fs.watch (FSEvents/kqueue) FREEZES pi's TUI
-  //      on macOS — the kernel event-notification path conflicts with raw-mode
-  //      stdin reads (Node issue #20148), wedging ALL keyboard input while a
-  //      watch is armed (the exact freeze reported in dogfooding). So we use
-  //      fs.watchFile instead: it stat-polls on the libuv threadpool, which is
-  //      independent of the event loop / stdin and does NOT freeze the overlay.
-  //      The ~1.5s poll interval is the debounce; refreshTimelineTail is an
-  //      idempotent re-derivation, so a poll never duplicates or drops a row.
-  //      See decision 0013 §Revision.
-
-  /** Absolute path to the observer flow log. */
-  private timelinePath(): string {
-    return join(this.state.cwd, ".harness-observer", "events.jsonl");
-  }
-
-  /** Begin polling events.jsonl for live tail updates. No-op when no TUI is
-   *  wired or the initial fetch already failed (file absent → nothing to tail).
-   *  Uses `fs.watchFile` (stat polling), NOT `fs.watch`: the latter's
-   *  FSEvents/kqueue notification path freezes pi's raw-mode stdin on macOS
-   *  (Node #20148). watchFile polls on the threadpool, which is stdin-safe. */
-  private startTimelineWatch(): void {
-    if (!LIVE_TAIL_ENABLED) return; // see kill-switch note above
-    if (!this.tui) return;
-    if (this.data.errors.timeline) return; // initial fetch failed → nothing to tail
-    const file = this.timelinePath();
-    this.watchListener = (curr: Stats, prev: Stats) => {
-      // watchFile fires once at start with curr === prev; skip no-ops. Re-derive
-      // only when the file actually changed (size or mtime).
-      if (curr.size === prev.size && curr.mtimeMs === prev.mtimeMs) return;
-      void this.refreshTimelineTail();
-    };
-    try {
-      watchFile(file, { persistent: false, interval: 1500 }, this.watchListener);
-    } catch {
-      this.watchListener = undefined; // belt-and-suspenders — keep initial render
-    }
-  }
-
-  /** Re-derive the timeline tail from the current file contents and ask the TUI
-   *  to re-render. Pure re-derivation via `readTimelineTail` ⇒ no duplicate or
-   *  dropped rows even when the watcher coalesces, re-fires, or the file shrank.
-   *  On read failure (file deleted / permissions mid-watch) degrades to a dim
-   *  message. Public so the integration test can drive one update deterministically
-   *  without depending on `fs.watch` timing. */
-  async refreshTimelineTail(): Promise<void> {
-    try {
-      const text = await readFile(this.timelinePath(), "utf8");
-      const errors = { ...this.data.errors };
-      delete errors.timeline; // recovered from a prior transient error
-      this.data = { ...this.data, timeline: readTimelineTail(text), errors };
-    } catch {
-      this.degradeTimeline();
-      return;
-    }
-    this.tui?.requestRender();
-  }
-
-  /** Mark the timeline tab degraded (watcher/read failure) and re-render. */
-  private degradeTimeline(): void {
-    this.data = {
-      ...this.data,
-      errors: { ...this.data.errors, timeline: "watch" },
-    };
-    this.tui?.requestRender();
-  }
-
-  dispose(): void {
-    // US-016: stop polling events.jsonl. The TUI calls dispose() on every close
-    // path (Esc / refresh / install — verified in pi-coding-agent
-    // interactive-mode.js showExtensionCustom.close), so the poller never
-    // outlives the overlay. unwatchFile(listener) removes just our listener.
-    if (this.watchListener) {
-      try {
-        unwatchFile(this.timelinePath(), this.watchListener);
-      } catch {
-        // best-effort — must not throw out of dispose
-      }
-      this.watchListener = undefined;
-    }
   }
 }
 
@@ -754,8 +639,8 @@ async function handleHarnessCommand(
     do {
       const data = await fetchDashboardData(pi, ctx);
       result = await ctx.ui.custom<HarnessOverlayResult>(
-        (tui, _theme, _kb, done) =>
-          new HarnessOverlayComponent({ view, state, flags, fg, onDone: done, data, tui }),
+        (_tui, _theme, _kb, done) =>
+          new HarnessOverlayComponent({ view, state, flags, fg, onDone: done, data }),
         { overlay: true, overlayOptions: { width: "76%", margin: 2 } }
       );
     } while (result.action === "refresh");

@@ -39,14 +39,14 @@ an inbound harness tool — exactly as its semantics require.
 2. **Live tail** — the payoff (§8.3). The timeline appends new events in real
    time as the agent makes harness-cli calls, via `fs.watch` on `events.jsonl`
    - async re-render. This is what turns "learn how the agent uses harness"
-   into a visible loop. **🛑 BLOCKED (US-016 deferred):** the live tail's
-   plumbing landed (`readTimelineTail` + a gated watcher), but the background
-   file-watch **froze the DASHBOARD** in the real TUI (`fs.watch` confirmed;
-   `fs.watchFile` inconclusive). The watcher is DISABLED (`LIVE_TAIL_ENABLED =
-   false`); the overlay reverts to US-015 manual-`r` behavior. Re-enable is
-   backlog #7 — isolate why any background file-watch wedges pi's raw-stdin
-   overlay. The pure `readTimelineTail` re-derives the
-   tail idempotently on every watcher fire (no dup/drop).
+   into a visible loop. **🪦 RETIRED (US-016, 2026-07-07):** the live tail was
+   dropped (not merely deferred). A PTY probe proved the freeze is NOT the watch
+   primitive (`fs.watch`/`fs.watchFile` both stayed healthy vs pi's raw-stdin
+   attachment) — the cause is pi-internal (the render loop) and needs a real-TUI
+   dogfood to isolate, which wasn't worth it for an unneeded feature. The code +
+   gated watcher were removed; the overlay uses US-015 manual-`r` refresh.
+   Backlog #7 closed as rejected. If revived: dogfood `requestRender()` from an
+   async callback in the real TUI first — the headless tests can't catch it.
 
 3. **Observer onboarding** — the adopt path (§8.1). When `observerInstalled`
    is false, the dashboard shows a one-line prompt + an `o` key that runs the

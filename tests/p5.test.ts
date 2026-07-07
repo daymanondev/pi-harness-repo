@@ -153,7 +153,7 @@ test("db_before/after non-numeric values are dropped by toCounts", () => {
   assert.deepEqual(ev.dbAfter, { story: 6 }, "null entry dropped");
 });
 
-// ─── layer 1: readTimelineTail (US-016 live-tail re-derivation seam) ────────
+// ─── layer 1: readTimelineTail (US-015 timeline re-derivation seam) ────────
 
 console.log("=== readTimelineTail ===");
 
@@ -437,17 +437,6 @@ function mockHarness(cwd: string, keySeqs: string[][] = [["\u001b"]]) {
   const state = {
     customCalls: 0,
     renders: [] as string[][],
-    /** # of times the live-tail watcher entry asked the TUI to re-render. */
-    requestRenderCalls: 0,
-    /** Last overlay component (US-016: so tests can drive refreshTimelineTail). */
-    lastComponent: undefined as
-      | undefined
-      | {
-          render?(w: number): string[];
-          handleInput?(d: string): void;
-          refreshTimelineTail(): Promise<void>;
-          dispose?(): void;
-        },
   };
   let seqIdx = 0;
   const registeredCommands = new Map<string, (a: string, c: unknown) => Promise<void>>();
@@ -465,8 +454,7 @@ function mockHarness(cwd: string, keySeqs: string[][] = [["\u001b"]]) {
       return { stdout: "", stderr: "", code: 0, killed: false };
     },
   };
-  /** Mock pi-tui TUI: requestRender is the live-tail re-render lever (OQ-4). */
-  const tui = { requestRender: () => { state.requestRenderCalls++; } };
+  const tui = {};
   const ctx = {
     cwd,
     signal: undefined as AbortSignal | undefined,
@@ -478,15 +466,13 @@ function mockHarness(cwd: string, keySeqs: string[][] = [["\u001b"]]) {
       setStatus() {},
       custom: async (
         factory: (t: unknown, th: unknown, kb: unknown, done: (r: unknown) => void) => {
-          handleInput?(d: string): void; render?(w: number): string[]; dispose?(): void;
+          handleInput?(d: string): void; render?(w: number): string[];
         }
       ) => {
         state.customCalls++;
         let result: unknown;
-        let closedByComponent = false;
-        const done = (r: unknown) => { result = r; closedByComponent = true; };
+        const done = (r: unknown) => { result = r; };
         const comp = factory(tui, { fg: (_c: string, t: string) => t }, {}, done);
-        state.lastComponent = comp as typeof state.lastComponent;
         const renders: string[] = [];
         if (typeof comp.render === "function") renders.push(comp.render(76).join("\n"));
         const seq = keySeqs[seqIdx++] ?? ["\u001b"];
@@ -494,14 +480,6 @@ function mockHarness(cwd: string, keySeqs: string[][] = [["\u001b"]]) {
           comp.handleInput?.(k);
           if (result !== undefined) break;
           if (typeof comp.render === "function") renders.push(comp.render(76).join("\n"));
-        }
-        // Faithful to the real showExtensionCustom.close(): dispose ONLY when
-        // the component actually closed itself (Esc/refresh/install). When the
-        // key sequence ends open, return a harmless `close` so the handler's
-        // do/while exits cleanly, but leave the component alive + undisposed so
-        // live-tail tests can drive refreshTimelineTail then dispose() itself.
-        if (closedByComponent) {
-          try { comp.dispose?.(); } catch { /* ignore */ }
         }
         state.renders.push(renders);
         return result ?? { action: "close" };
@@ -571,80 +549,6 @@ test("wired: missing events.jsonl → timeline tab degrades to a dim message", a
     const renders = state.renders[0]!;
     const tl = renders[renders.length - 1]!;
     assert.match(tl, /timeline unavailable/);
-  } finally {
-    rmSync(cwd, { recursive: true, force: true });
-  }
-});
-
-// ─── layer 2 wiring: US-016 live tail (fs.watch + async re-render) ─────────
-
-console.log("\n=== wiring: US-016 live tail ===");
-
-test("wired: live tail — appending events.jsonl surfaces the new row without re-opening the overlay", async () => {
-  const mod = await import("../extensions/harness/index.ts");
-  const cwd = repoWithEvents(FIXTURE_EVENTS);
-  try {
-    // key seq ["t"] lands on the timeline tab and does NOT close → the component
-    // stays alive so we can drive the watcher entry point directly.
-    const { pi, ctx, state, registeredCommands } = mockHarness(cwd, [["t"]]);
-    mod.default(pi as never);
-    await registeredCommands.get("harness")!("", ctx as never);
-
-    const comp = state.lastComponent!;
-    const before = state.renders[0]!.at(-1)!;
-    assert.doesNotMatch(before, /97→98/, "live event not yet present");
-
-    // Simulate the observer appending a flow event while the tab is open.
-    appendFileSync(
-      join(cwd, ".harness-observer", "events.jsonl"),
-      "\n" + jl({ ts: "2026-07-04T10:40:00+00:00", cmd: ["trace"], exit: 0, duration_ms: 12, stdout: "Trace #98 recorded.", stderr: "", db_before: { trace: 97 }, db_after: { trace: 98 } })
-    );
-    // Drive the watcher entry point (the real fs.watch fires the same method).
-    await comp.refreshTimelineTail();
-
-    const after = (comp.render?.(76) ?? []).join("\n");
-    assert.match(after, /trace/, "appended event surfaces in place");
-    assert.match(after, /trace: 97→98/, "db delta of the live event surfaces");
-    assert.equal(state.customCalls, 1, "overlay was NOT re-opened — update was in-place");
-    assert.ok(state.requestRenderCalls >= 1, "the watcher entry requested a re-render (OQ-4 lever)");
-    comp.dispose?.();
-  } finally {
-    rmSync(cwd, { recursive: true, force: true });
-  }
-});
-
-test("wired: refreshTimelineTail degrades to a dim message when events.jsonl disappears mid-watch", async () => {
-  const mod = await import("../extensions/harness/index.ts");
-  const cwd = repoWithEvents(FIXTURE_EVENTS);
-  try {
-    const { pi, ctx, state, registeredCommands } = mockHarness(cwd, [["t"]]);
-    mod.default(pi as never);
-    await registeredCommands.get("harness")!("", ctx as never);
-    const comp = state.lastComponent!;
-
-    // File deleted under the watcher (ENOENT mid-watch).
-    rmSync(join(cwd, ".harness-observer", "events.jsonl"));
-    await comp.refreshTimelineTail();
-
-    const after = (comp.render?.(76) ?? []).join("\n");
-    assert.match(after, /timeline unavailable/, "degrades to the dim message, never throws");
-    comp.dispose?.();
-  } finally {
-    rmSync(cwd, { recursive: true, force: true });
-  }
-});
-
-test("wired: dispose tears down the watcher and is idempotent (never throws)", async () => {
-  const mod = await import("../extensions/harness/index.ts");
-  const cwd = repoWithEvents(FIXTURE_EVENTS);
-  try {
-    const { pi, ctx, state, registeredCommands } = mockHarness(cwd, [["t"]]);
-    mod.default(pi as never);
-    await registeredCommands.get("harness")!("", ctx as never);
-    const comp = state.lastComponent!;
-
-    assert.doesNotThrow(() => comp.dispose?.(), "first dispose closes the watcher + clears the debounce");
-    assert.doesNotThrow(() => comp.dispose?.(), "second dispose is a no-op");
   } finally {
     rmSync(cwd, { recursive: true, force: true });
   }
