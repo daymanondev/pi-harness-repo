@@ -219,6 +219,41 @@ export function decideGateA(
   return { block: false };
 }
 
+// ─── trace-at-done gate (US-022 / Option C) ────────────────────────────────
+//
+// US-022 moves the trace nag off the every-turn `before_agent_start` injection
+// and onto the done-claim moment. OQ-C1 (resolved): pi fires `tool_call` for
+// EVERY tool with no name filtering — agent-session.js sets
+// `agent.beforeToolCall` → `runner.emitToolCall`, which runs all handlers
+// unconditionally — and `goal_complete` is the task-completion tool the agent
+// calls to claim done. So the surgical trigger is: block `goal_complete` until
+// a trace is recorded this session.
+//
+// This enforces the Done Definition ("done only when a trace has been
+// recorded") at exactly the right moment, instead of nagging on chat turns
+// (which `before_agent_start` cannot distinguish from editing turns — the
+// residual US-021 timing bug). Pure contract, like the other gates.
+
+/** Minimal per-session view the trace-at-done gate reads. */
+export interface TraceGateSession {
+  traceRecorded: boolean;
+}
+
+export const REASON_TRACE = `Repository-harness flow gate (done-claim): the Done Definition requires a recorded trace before a task is complete, and no trace has been recorded this session. Run:
+  scripts/bin/harness-cli trace --summary "\u2026" --intake <id> --read \u2026 --changed \u2026 --outcome \u2026
+then re-issue the goal_complete call.`;
+
+/**
+ * US-022 — the trace nag at the done-claim moment. Caller confirms the harness
+ * is set up (cli+db present) and that the triggering tool is `goal_complete`.
+ * Returns `block:false` once a trace has been recorded this session. Does NOT
+ * touch decideGateA or Gate B′ (presentation/trigger change only).
+ */
+export function gateTraceOnDone(session: TraceGateSession): GateDecision {
+  if (session.traceRecorded) return { block: false };
+  return { block: true, reason: REASON_TRACE };
+}
+
 // ─── readiness (P6: next-required-action) ──────────────────────────────────
 //
 // The gate decisions above answer "block this tool_call?". `readiness()`

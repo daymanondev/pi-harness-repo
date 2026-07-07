@@ -307,7 +307,7 @@ test("US-020: post-install, everything ready → 'installed — ready'", () => {
   assert.equal(installNotifyText(sess(true, true), 0), "repository-harness installed — ready");
 });
 
-console.log("=== US-021: injection leads with next-action, drops vanity counts ===");
+console.log("=== US-022: injection carries only ambient nags; trace moves to done-claim ===");
 
 type InjectionMessage = (
   s: HarnessState,
@@ -326,13 +326,16 @@ test("US-021: harness not set up → quiet (footer/widget cover setup)", () => {
   assert.equal(injectionMessage(hstate({ cliInstalled: false }), sess(false, false), driftN(0)), "");
 });
 
-test("US-021: intake unmet → LEADS with next-action; no vanity counts; trace nag kept", () => {
+test("US-022: intake unmet, no drift → quiet (intake nag dropped; Gate A + footer cover it)", () => {
   const out = injectionMessage(hstate({}), sess(false, false), driftN(0));
-  assert.ok(out.startsWith("[harness] next: record an intake before editing."), out);
-  // vanity counts are gone from the lead
-  assert.ok(!/durable layer:|intakes ·|stories ·|traces ·/.test(out), out);
-  // trace nag still present (actionable)
-  assert.ok(/Done Definition requires a recorded trace/.test(out), out);
+  assert.equal(out, "", `expected quiet, got: ${out}`);
+  assert.ok(!/record an intake before editing/.test(out), `intake nag leaked: ${out}`);
+});
+
+test("US-022: trace-owing session, chat turn (no drift) → no trace nag (moved to done-claim)", () => {
+  const out = injectionMessage(hstate({}), sess(true, false), driftN(0));
+  assert.equal(out, "", `expected quiet, got: ${out}`);
+  assert.ok(!/Done Definition requires a recorded trace/.test(out), `trace nag leaked: ${out}`);
 });
 
 test("US-021: drift present, intake ok → drift next-action + drift nag", () => {
@@ -340,6 +343,13 @@ test("US-021: drift present, intake ok → drift next-action + drift nag", () =>
   assert.ok(out.startsWith("[harness] next: 2 drift — sync markdown↔durable."), out);
   assert.ok(/markdown↔durable drift detected/.test(out), out);
   assert.ok(!/durable layer:/.test(out), "vanity counts must be gone");
+});
+
+test("US-022: intake unmet + drift present → drift nag only (intake/trace dropped)", () => {
+  const out = injectionMessage(hstate({}), sess(false, false), driftReal(2));
+  assert.ok(/markdown↔durable drift detected/.test(out), `expected drift nag, got: ${out}`);
+  assert.ok(!/record an intake before editing/.test(out), `intake nag leaked: ${out}`);
+  assert.ok(!/Done Definition requires a recorded trace/.test(out), `trace nag leaked: ${out}`);
 });
 
 test("US-021: all ready → quiet (drops counts; footer already says ready)", () => {

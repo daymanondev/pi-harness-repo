@@ -13,6 +13,7 @@ import {
   decideGateA,
   gateIntake,
   gatePrecondition,
+  gateTraceOnDone,
   isHarnessCliCall,
   isHarnessIntakeCall,
   isHarnessTraceCall,
@@ -181,6 +182,19 @@ test("read passes regardless", () => {
     decideGateA("read", { path: "x" }, OK, { intakeRecorded: false }).block,
     false
   );
+});
+
+console.log("=== gates: gateTraceOnDone (US-022 trace-at-done) ===");
+test("gateTraceOnDone: trace recorded → passes (goal_complete allowed)", () => {
+  assert.equal(gateTraceOnDone({ traceRecorded: true }).block, false);
+});
+test("gateTraceOnDone: no trace → blocks with the trace command in the reason", () => {
+  const d = gateTraceOnDone({ traceRecorded: false });
+  assert.equal(d.block, true);
+  const reason = (d as { reason: string }).reason;
+  assert.match(reason, /done-claim/);
+  assert.match(reason, /harness-cli trace --summary/);
+  assert.match(reason, /re-issue the goal_complete/);
 });
 
 console.log("=== drift: parsers ===");

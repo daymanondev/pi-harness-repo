@@ -2,7 +2,7 @@
 
 ## Status
 
-planned
+implemented
 
 ## Lane
 
@@ -55,9 +55,24 @@ US-021 already uses).
   nag at `before_agent_start` until an edit/trace-eligible `tool_call` has
   occurred this turn (re-evaluate in `tool_result`), so chat-only turns stay
   quiet.
+
+  **RESOLVED (yes — surgical path taken).** There is no pre-`goal_complete`
+  *hook*, but `goal_complete` is itself a tool, and pi fires `tool_call` for
+  every tool with **no name filtering**: `agent-session.js` sets
+  `agent.beforeToolCall` → `runner.emitToolCall`, which runs all handlers
+  unconditionally and aborts on `{block:true}`. So the trace nag fires by
+  blocking `goal_complete` in the existing `tool_call` handler until a trace
+  is recorded this session (`gateTraceOnDone`). The fallback heuristic was not
+  needed.
 - **OQ-C2:** intake is already enforced by Gate A at the edit moment; confirm
   the injection's intake nag is redundant once Gate A exists (it likely is →
   drop it entirely from injection, don't just defer it).
+
+  **RESOLVED (yes — dropped entirely).** `decideGateA` step 5 blocks
+  write/edit when `!session.intakeRecorded`, and the footer (US-018) still
+  surfaces the intake next-action from `readiness()`. The per-turn intake nag
+  was therefore redundant and noisy on chat turns → removed from
+  `injectionMessage` (not deferred).
 
 ## Design Notes
 
@@ -98,4 +113,21 @@ harness-improvement intake — note in `--friction` on this story's first trace.
 
 ## Evidence
 
-(pending implementation)
+- `extensions/harness/gates.ts` — new pure `gateTraceOnDone(session)` +
+  `REASON_TRACE` (carries the same `harness-cli trace …` command text).
+  `decideGateA` / Gate B′ byte-identical (untouched).
+- `extensions/harness/index.ts` —
+  - `injectionMessage` now carries **only ambient** signals: setup (early
+    `return ""`) + drift. The intake next-action and the trace-nag block were
+    removed; the next-action line now shows only when `firstUnmet === "drift"`.
+  - `tool_call` handler: new `goal_complete` intercept calls `gateTraceOnDone`
+    and returns its block when no trace is recorded this session (guarded by
+    `cliInstalled && dbInitialized` so non-harness repos are never trapped).
+- Tests: `tests/p2.test.ts` +2 (`gateTraceOnDone` pass/block); `tests/p6.test.ts`
+  injection suite rewritten for US-022 — chat-turn (trace-owing, no drift) → `""`,
+  intake-unmet → `""`, intake-unmet+drift → drift nag only; drift/ready unchanged.
+- `npx tsc --noEmit` clean. p2 46 · p3 33 · p4 58 · p5 31 · p6 36 — 0 failures,
+  0 regressions. lens_diagnostics mode=all: 0 errors.
+- OQ-C1 resolved by reading pi runtime (`dist/core/agent-session.js`
+  `_installAgentToolHooks` → `beforeToolCall` → `runner.emitToolCall`, no name
+  filter; `dist/core/extensions/runner.js` `emitToolCall` runs all handlers).

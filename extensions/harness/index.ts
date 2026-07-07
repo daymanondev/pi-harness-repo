@@ -34,7 +34,7 @@ import {
   type ExecFn,
   type HarnessState,
 } from "./detect.js";
-import { decideGateA, isHarnessIntakeCall, isHarnessTraceCall, readiness } from "./gates.js";
+import { decideGateA, gateTraceOnDone, isHarnessIntakeCall, isHarnessTraceCall, readiness } from "./gates.js";
 import { detectDrift, summarizeDrift, type DriftRecord } from "./drift.js";
 import {
   getSession,
@@ -237,31 +237,33 @@ export function injectionMessage(
   // actionable counts for the agent yet, so stay quiet.
   if (!(state.cliInstalled && state.dbInitialized)) return "";
 
-  // US-021 (OQ-2): the injection is the agent-facing per-turn surface. It leads
-  // with the next-required-action from readiness() and keeps only actionable
-  // nags (drift, trace). Vanity counts (intakes·stories·traces) belong in the
-  // dashboard Stats tab, not here — they were the "junk" the agent skimmed.
+  // US-022 (Option C): the injection now carries ONLY ambient,
+  // turn-type-independent signals — setup (handled by the early return above)
+  // and drift. The two moment-dependent requirements moved OFF this surface:
+  //   • intake → already enforced by Gate A at the edit moment (decideGateA
+  //     step 5); the footer (US-018) still surfaces it. The per-turn nag was
+  //     redundant (OQ-C2) and noisy on chat turns → dropped entirely.
+  //   • trace → moved to the done-claim moment: gateTraceOnDone blocks
+  //     goal_complete in the tool_call handler (OQ-C1 = yes: tool_call fires
+  //     for goal_complete with no name filtering).
+  // Net effect: a pure-chat turn stays quiet even when the session owes an
+  // intake or a trace, because before_agent_start cannot tell chat from
+  // editing — the residual US-021 timing bug this fixes.
   const lines: string[] = [];
   const r = readiness(
     { cliInstalled: true, dbInitialized: true },
     { intakeRecorded: session.intakeRecorded, traceRecorded: session.traceRecorded },
     drift.length
   );
-  if (r.nextAction) {
+  // next-action line: only for the remaining ambient blocker (drift). Setup
+  // returned early above; intake/trace are no longer surfaced here.
+  if (r.firstUnmet === "drift" && r.nextAction) {
     lines.push(`[harness] next: ${r.nextAction}.`);
   }
   if (drift.length > 0) {
     lines.push(
       `[harness] ! ${drift.length} markdown↔durable drift detected ` +
         `(${summarizeDrift(drift).ids}). audit cannot see this; sync before closing.`
-    );
-  }
-  if (!session.traceRecorded) {
-    lines.push(
-      `[harness] Done Definition requires a recorded trace before this task ` +
-        `is complete. No trace recorded this session. Run ` +
-        `\`scripts/bin/harness-cli trace --summary … --intake <id> ` +
-        `--read … --changed … --outcome …\`.`
     );
   }
   return lines.join("\n");
@@ -763,7 +765,8 @@ export default function (pi: ExtensionAPI) {
     void cliBinaryPath(ctx.cwd); // keep public-surface reference for P3
   });
 
-  // tool_call: Gate A / A′ (write/edit/bash) + Gate B′ (drift on trace).
+  // tool_call: Gate A / A′ (write/edit/bash) + Gate B′ (drift on trace) +
+  //           trace-at-done (goal_complete, US-022).
   pi.on("tool_call", async (event, ctx) => {
     const state: HarnessState = await detectHarnessCached(ctx.cwd, makeExec(pi), {
       signal: ctx.signal,
@@ -776,6 +779,21 @@ export default function (pi: ExtensionAPI) {
       claudeShimPresent: false,
       observerInstalled: false,
     }));
+
+    // US-022 (Option C) — trace nag at the done-claim moment. `goal_complete`
+    // is the task-completion tool; tool_call fires for it with no name
+    // filtering (OQ-C1 = yes). Block it until a trace is recorded this
+    // session, enforcing the Done Definition at the right moment instead of
+    // nagging every chat turn from before_agent_start. Skipped on non-harness
+    // repos (state not set up) so goal_complete is never trapped elsewhere.
+    if (
+      state.cliInstalled &&
+      state.dbInitialized &&
+      event.toolName === "goal_complete"
+    ) {
+      const doneDecision = gateTraceOnDone(getSession(ctx.cwd));
+      if (doneDecision.block) return doneDecision;
+    }
 
     // Gate B′ — drift blocks the done/trace step (bash only)
     if (
