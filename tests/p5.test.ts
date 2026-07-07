@@ -114,6 +114,7 @@ test("parses a well-formed line into a TimelineEvent", () => {
     db_after: { intake: 3, story: 7 },
   });
   const [ev] = parseEventsJsonl(text);
+  assert.ok(ev, "expected one parsed event");
   assert.equal(ev.ts, "2026-07-04T10:32:00+00:00");
   assert.deepEqual(ev.cmd, ["intake", "--type", "spec_slice"]);
   assert.equal(ev.exit, 0);
@@ -138,6 +139,7 @@ test("skips blank lines and unparseable / non-object lines", () => {
 
 test("missing fields degrade to zero / empty (never throws, never undefined)", () => {
   const [ev] = parseEventsJsonl(jl({ cmd: ["--version"] }));
+  assert.ok(ev, "expected one parsed event");
   assert.equal(ev.exit, 0);
   assert.equal(ev.durationMs, 0);
   assert.equal(ev.ts, "");
@@ -150,6 +152,7 @@ test("db_before/after non-numeric values are dropped by toCounts", () => {
   const [ev] = parseEventsJsonl(
     jl({ db_before: { intake: "oops", story: 5 }, db_after: { story: 6, trace: null } })
   );
+  assert.ok(ev, "expected one parsed event");
   assert.deepEqual(ev.dbBefore, { story: 5 }, "string entry dropped");
   assert.deepEqual(ev.dbAfter, { story: 6 }, "null entry dropped");
 });
