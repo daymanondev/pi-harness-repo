@@ -18,11 +18,13 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   parseMatrixNumeric,
+  parseGrilledStoryIds,
   parseStats,
   parseBacklogOpen,
   parseToolsJson,
   reduceDashboardNav,
   renderDashboardLines,
+  nextActionFor,
   ZERO_STATS,
   type DashboardData,
   type DashboardNav,
@@ -71,7 +73,7 @@ const id = (_c: string, t: string) => t; // identity fg for plain-text assertion
 
 /** Build a DashboardData with empty defaults, overridden by `over`. */
 function dashData(over: Partial<DashboardData> = {}): DashboardData {
-  return { matrix: [], stats: ZERO_STATS, backlog: [], tools: [], drift: [], timeline: [], packets: {}, errors: {}, ...over };
+  return { matrix: [], stats: ZERO_STATS, backlog: [], tools: [], drift: [], timeline: [], packets: {}, grilledStoryIds: new Set(), errors: {}, ...over };
 }
 
 /** Build a DashboardNav for render assertions (cursor + drill default off). */
@@ -219,6 +221,32 @@ test("malformed JSON → null; non-array → null (never throws)", () => {
   assert.equal(parseToolsJson("not json"), null);
   assert.equal(parseToolsJson("{"), null);
   assert.equal(parseToolsJson('{"a":1}'), null);
+});
+
+// ─── control-surface routing (US-023) ─────────────────────────────────────
+
+console.log("=== dashboard: nextActionFor + grilled signal (US-023) ===");
+test("parseGrilledStoryIds: extracts US-NNN tokens, ignores header/separator", () => {
+  const sql = "story_id\n--------\nUS-006  \nUS-023  \n";
+  assert.deepEqual(parseGrilledStoryIds(sql), new Set(["US-006", "US-023"]));
+});
+test("parseGrilledStoryIds: empty/noise/garbage → empty set (never throws)", () => {
+  assert.deepEqual(parseGrilledStoryIds(""), new Set());
+  assert.deepEqual(parseGrilledStoryIds("story_id\n--------\nno ids here\n"), new Set());
+});
+test("nextActionFor: grilled story → implement + packet-path prompt", () => {
+  const a = nextActionFor({ id: "US-023" }, new Set(["US-023", "US-006"]));
+  assert.equal(a.grilled, true);
+  assert.equal(a.next, "implement");
+  assert.match(a.prompt, /implement US-023/);
+  assert.match(a.prompt, /docs\/stories\/US-023-\*\.md/);
+});
+test("nextActionFor: ungrilled story → grill + skill+id prompt", () => {
+  const a = nextActionFor({ id: "US-024" }, new Set(["US-023"]));
+  assert.equal(a.grilled, false);
+  assert.equal(a.next, "grill");
+  assert.match(a.prompt, /harness-intake-griller/);
+  assert.match(a.prompt, /US-024/);
 });
 
 // ─── render: matrix tab ────────────────────────────────────────────────────
@@ -474,6 +502,41 @@ test("story detail: missing packet → '(no packet file — orphan durable)'", (
   const text = renderDashboardLines(bareState(), nav("matrix", 0, { kind: "matrix", index: 0 }), data, id).join("\n");
   assert.match(text, /no packet file/);
   assert.match(text, /US-999/);
+});
+console.log("=== dashboard: grilled-badge + next-action routing (US-023) ===");
+test("matrix badge: grilled row shows ●, ungrilled shows ○", () => {
+  const rows = parseMatrixNumeric(FIXTURE_MATRIX); // US-001 / US-002 / US-003
+  const data = dashData({ matrix: rows, grilledStoryIds: new Set(["US-001"]) });
+  const lines = renderDashboardLines(bareState(), nav("matrix"), data, id).join("\n").split("\n");
+  const us001 = lines.find((l) => /US-001/.test(l))!;
+  const us002 = lines.find((l) => /US-002/.test(l))!;
+  assert.ok(/●/.test(us001), "US-001 (grilled) row should show ●");
+  assert.ok(/○/.test(us002), "US-002 (ungrilled) row should show ○");
+});
+test("matrix badge: header carries the grilled 'g' column label", () => {
+  const data = dashData({ matrix: parseMatrixNumeric(FIXTURE_MATRIX), grilledStoryIds: new Set() });
+  const headerLine = renderDashboardLines(bareState(), nav("matrix"), data, id).join("\n").split("\n").find((l) => /u i e p/.test(l))!;
+  assert.match(headerLine, /\bg\b/);
+});
+test("story detail: grilled shows yes + next: implement + packet prompt", () => {
+  const row = { id: "US-023", title: "Dashboard grilled-badge", status: "in_progress", unit: 0, integ: 0, e2e: 0, plat: 0 };
+  const data = dashData({
+    matrix: [row],
+    grilledStoryIds: new Set(["US-023"]),
+    packets: { "US-023": PACKET("US-023", "in_progress", "normal", "- badge.", "t=1") },
+  });
+  const text = renderDashboardLines(bareState(), nav("matrix", 0, { kind: "matrix", index: 0 }), data, id).join("\n");
+  assert.match(text, /grilled:.*yes/);
+  assert.match(text, /next:.*implement/);
+  assert.match(text, /docs\/stories\/US-023-\*\.md/);
+});
+test("story detail: ungrilled shows no + next: grill + skill prompt", () => {
+  const row = { id: "US-024", title: "ADR reader", status: "planned", unit: 0, integ: 0, e2e: 0, plat: 0 };
+  const data = dashData({ matrix: [row], grilledStoryIds: new Set() });
+  const text = renderDashboardLines(bareState(), nav("matrix", 0, { kind: "matrix", index: 0 }), data, id).join("\n");
+  assert.match(text, /grilled:.*no/);
+  assert.match(text, /next:.*grill/);
+  assert.match(text, /harness-intake-griller/);
 });
 test("backlog detail: renders full fields + detail tail", () => {
   const row = { id: 5, title: "Dashboard view-only", status: "proposed", risk: "normal", detail: "Turns gauge into control surface." };

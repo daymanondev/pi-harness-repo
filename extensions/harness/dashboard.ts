@@ -47,6 +47,20 @@ export interface MatrixRow {
 }
 
 /**
+ * Parse `query sql "SELECT DISTINCT story_id FROM intake WHERE input_type=
+ * 'spec_slice' AND story_id IS NOT NULL"` output into the grilled-story-id set
+ * (US-023). `query intakes` does NOT surface the `story_id` column, so the
+ * durable layer is queried directly for the precise intake-linkage signal.
+ * Pure + total: picks up every `US-NNN` token (header/separator never match)
+ * and never throws on partial/empty output.
+ */
+export function parseGrilledStoryIds(stdout: string): Set<string> {
+  const ids = new Set<string>();
+  for (const m of stdout.matchAll(/\bUS-\d+\b/g)) ids.add(m[0]!);
+  return ids;
+}
+
+/**
  * Parse `query matrix --numeric` stdout into rows. Pure + total: any line that
  * does not match the `US-NNN … <status> <0|1> <0|1> <0|1> <0|1>` shape (headers,
  * separators, blank lines, malformed rows) is silently skipped, so a partial or
@@ -320,6 +334,9 @@ export interface DashboardData {
   timeline: TimelineEvent[];
   /** storyId → packet file (filename + raw markdown), for the story detail pane. */
   packets: Record<string, PacketRef>;
+  /** Story ids linked by a `spec_slice` intake = the grilled set (US-023).
+   *  Drives the Matrix grilled-badge + the detail-pane `next:` line. */
+  grilledStoryIds: ReadonlySet<string>;
   errors: Partial<Record<DashboardTab, string>>;
 }
 
@@ -327,6 +344,50 @@ export interface DashboardData {
 export interface PacketRef {
   filename: string;
   text: string;
+}
+
+// ─── control-surface routing (US-023) ──────────────────────────────────────
+
+/**
+ * The next action to take on a story, derived purely from its grilled-status.
+ * `grilled` = a `spec_slice` intake links the story (the durable signal).
+ * Packet-existence canNOT discriminate, because drift-gate B′ (US-003) forces a
+ * packet markdown on every durable story (else `orphan_durable` drift) — so the
+ * act of grilling *is* recording the `spec_slice` intake. This pure router is
+ * the single source of truth for the Matrix grilled-badge + the detail-pane
+ * `next:` line, and is reused by the agent task-loop so both entry points
+ * (dashboard + "do US-NNN") route identically. Advisory only — no durable
+ * writes originate here (US-014 Command-Query invariant preserved).
+ */
+export interface NextAction {
+  grilled: boolean;
+  next: "grill" | "implement";
+  prompt: string;
+}
+
+/**
+ * Pure router: grilled → implement (hand off to a worker against the packet's
+ * acceptance criteria); ungrilled → grill (run harness-intake-griller to record
+ * a spec_slice intake + packet). Advisory prompt text only; the operator runs
+ * it in their own pane/session.
+ */
+export function nextActionFor(
+  story: { id: string },
+  grilledStoryIds: ReadonlySet<string>
+): NextAction {
+  const grilled = grilledStoryIds.has(story.id);
+  if (grilled) {
+    return {
+      grilled: true,
+      next: "implement",
+      prompt: `implement ${story.id} — worker against docs/stories/${story.id}-*.md (acceptance criteria)`,
+    };
+  }
+  return {
+    grilled: false,
+    next: "grill",
+    prompt: `run harness-intake-griller for ${story.id} (record a spec_slice intake + packet)`,
+  };
 }
 
 // ─── drill-down navigation (US-014) ────────────────────────────────────────
@@ -496,7 +557,7 @@ export function renderDashboardLines(
   if (nav.drill) {
     content.push(...renderDetail(nav.drill, data, fg, innerW));
   } else if (nav.tab === "matrix") {
-    content.push(...renderMatrixTab(data.matrix, nav.cursor, fg, innerW));
+    content.push(...renderMatrixTab(data.matrix, data.grilledStoryIds, nav.cursor, fg, innerW));
   } else if (nav.tab === "stats") {
     content.push(...renderStatsTab(data, fg, innerW));
   } else if (nav.tab === "backlog") {
@@ -522,20 +583,29 @@ export function renderDashboardLines(
 }
 
 /** Render the proof-matrix tab body (column header + rows, with a selection
- *  cursor for drill-down). Inner width = innerW. */
-function renderMatrixTab(matrix: MatrixRow[], cursor: number, fg: FgFn, innerW: number): string[] {
+ *  cursor for drill-down). US-023: each row carries a leading grilled-badge
+ *  (● grilled / ○ ungrilled) derived from `nextActionFor`. Inner width = innerW. */
+function renderMatrixTab(
+  matrix: MatrixRow[],
+  grilledStoryIds: ReadonlySet<string>,
+  cursor: number,
+  fg: FgFn,
+  innerW: number
+): string[] {
   const dim = (t: string) => fg("dim", t);
   const out: string[] = [];
   const innerW2 = innerW - MARK_W;
 
+  const BADGE_W = 2; // grilled-badge glyph (●/○) + trailing space
   const idW = 7;
   const statusW = 12;
   const proofW = 7; // "✓ ✓ ✓ ✓" / "u i e p" — 4 marks joined by single spaces
   const gap = 2;
-  const titleW = Math.max(10, innerW2 - (idW + statusW + proofW + 3 * gap));
+  const titleW = Math.max(10, innerW2 - (BADGE_W + idW + statusW + proofW + 3 * gap));
 
   // column header (indented to align with the marker column)
   const head =
+    padRight(dim("g"), BADGE_W - 1) + " " +
     padRight(dim("id"), idW) +
     gapSpaces(gap) +
     padRight(dim("title"), titleW) +
@@ -551,12 +621,14 @@ function renderMatrixTab(matrix: MatrixRow[], cursor: number, fg: FgFn, innerW: 
   }
 
   matrix.forEach((r, i) => {
+    const action = nextActionFor(r, grilledStoryIds);
+    const badge = (action.grilled ? fg("success", "●") : fg("dim", "○")) + " ";
     const id = padRight(r.id, idW);
     const title = padRight(truncateAnsi(r.title, titleW), titleW);
     const status = padRight(fg(statusColor(r.status), r.status), statusW);
     const proof =
       proofMark(r.unit, fg) + " " + proofMark(r.integ, fg) + " " + proofMark(r.e2e, fg) + " " + proofMark(r.plat, fg);
-    out.push(rowMarker(i === cursor) + id + gapSpaces(gap) + title + gapSpaces(gap) + status + gapSpaces(gap) + proof);
+    out.push(rowMarker(i === cursor) + badge + id + gapSpaces(gap) + title + gapSpaces(gap) + status + gapSpaces(gap) + proof);
   });
   return out;
 }
@@ -801,11 +873,12 @@ function sectionLines(body: string, n: number, width: number, fg: FgFn): string[
     .map((l) => dim("  " + truncateAnsi(l, width)));
 }
 
-/** Render the drilled STORY detail: packet-derived status/lane + Acceptance +
- *  Evidence excerpts + the packet path. Pure. */
+/** Render the drilled STORY detail: packet-derived status/lane + grilled/next
+ *  routing (US-023) + Acceptance + Evidence excerpts + the packet path. Pure. */
 function renderStoryDetail(
   row: MatrixRow,
   packet: PacketRef | undefined,
+  grilledStoryIds: ReadonlySet<string>,
   fg: FgFn,
   innerW: number
 ): string[] {
@@ -818,6 +891,15 @@ function renderStoryDetail(
   const laneRaw = packet ? extractSection(packet.text, "Lane").split(/\r?\n/)[0] ?? "" : "";
   const lane = laneRaw.trim();
   out.push(`${dim("Status:")} ${fg(statusColor(status), status)}   ${dim("Lane:")} ${lane || dim("—")}`);
+  // US-023: grilled-status (intake-linkage) + next-action routing. Advisory only;
+  // the operator runs the prompt in their own pane. Shown for every story
+  // (grilled-ness is independent of packet presence).
+  const action = nextActionFor(row, grilledStoryIds);
+  out.push(
+    `${dim("grilled:")} ${action.grilled ? fg("success", "yes") : dim("no")}   ` +
+      `${dim("next:")} ${action.next === "implement" ? fg("accent", "implement") : fg("warning", "grill")}`
+  );
+  out.push(dim("→ " + truncateAnsi(action.prompt, innerW - 2)));
   if (!packet) {
     out.push(dim(`(no packet file — orphan durable; add docs/stories/${row.id}-*.md)`));
     return out;
@@ -901,7 +983,7 @@ function renderDetail(
   if (drill.kind === "matrix") {
     const row = data.matrix[drill.index];
     if (!row) return [fg("dim", "(row no longer exists — press r to refresh)")];
-    return renderStoryDetail(row, data.packets[row.id], fg, innerW);
+    return renderStoryDetail(row, data.packets[row.id], data.grilledStoryIds, fg, innerW);
   }
   if (drill.kind === "backlog") {
     const row = data.backlog[drill.index];

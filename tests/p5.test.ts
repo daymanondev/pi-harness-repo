@@ -75,6 +75,7 @@ function dataWith(events: TimelineEvent[], over: Partial<DashboardData> = {}): D
     drift: [],
     timeline: events,
     packets: {},
+    grilledStoryIds: new Set(),
     errors: {},
     ...over,
   };

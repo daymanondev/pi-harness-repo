@@ -58,6 +58,7 @@ import {
 } from "./overlay.js";
 import {
   parseMatrixNumeric,
+  parseGrilledStoryIds,
   parseStats,
   parseBacklogOpen,
   parseToolsJson,
@@ -326,7 +327,7 @@ class HarnessOverlayComponent {
     this.fg = o.fg;
     this.onDone = o.onDone;
     this.nav = { tab: o.tab ?? "matrix", cursor: 0, drill: null };
-    this.data = o.data ?? { matrix: [], stats: ZERO_STATS, backlog: [], tools: [], drift: [], timeline: [], packets: {}, errors: {} };
+    this.data = o.data ?? { matrix: [], stats: ZERO_STATS, backlog: [], tools: [], drift: [], timeline: [], packets: {}, grilledStoryIds: new Set(), errors: {} };
   }
 
   handleInput(data: string): void {
@@ -438,6 +439,32 @@ async function fetchMatrix(
     return res.code === 0 ? parseMatrixNumeric(res.stdout) : [];
   } catch {
     return [];
+  }
+}
+
+/** Fetch the grilled-story-id set for the US-023 control-surface signal
+ *  (grilled = a `spec_slice` intake links the story). `query intakes` does NOT
+ *  surface the `story_id` column, so the durable layer is queried directly via
+ *  SQL for the precise intake-linkage signal. Best-effort: any failure yields
+ *  an empty set so badges degrade to ungrilled, never throws out of the overlay. */
+async function fetchGrilledStoryIds(
+  pi: ExtensionAPI,
+  ctx: ExtensionCommandContext
+): Promise<Set<string>> {
+  try {
+    const bin = cliBinaryPath(ctx.cwd);
+    const res = await pi.exec(
+      bin,
+      [
+        "query",
+        "sql",
+        "SELECT DISTINCT story_id FROM intake WHERE input_type='spec_slice' AND story_id IS NOT NULL",
+      ],
+      { cwd: ctx.cwd, signal: ctx.signal, timeout: 5_000 }
+    );
+    return res.code === 0 ? parseGrilledStoryIds(res.stdout) : new Set();
+  } catch {
+    return new Set();
   }
 }
 
@@ -569,7 +596,7 @@ async function fetchDashboardData(
   pi: ExtensionAPI,
   ctx: ExtensionCommandContext
 ): Promise<DashboardData> {
-  const [matrix, stats, backlog, tools, drift, packets, timeline] = await Promise.all([
+  const [matrix, stats, backlog, tools, drift, packets, timeline, grilledStoryIds] = await Promise.all([
     fetchMatrix(pi, ctx),
     fetchStatsCounts(pi, ctx),
     fetchBacklogRows(pi, ctx),
@@ -577,6 +604,7 @@ async function fetchDashboardData(
     fetchDrift(pi, ctx),
     fetchPackets(pi, ctx),
     fetchTimeline(pi, ctx),
+    fetchGrilledStoryIds(pi, ctx),
   ]);
   const errors: Partial<Record<DashboardTab, string>> = {};
   if (stats === null) errors.stats = "stats";
@@ -592,6 +620,7 @@ async function fetchDashboardData(
     drift: drift ?? [],
     timeline: timeline ?? [],
     packets,
+    grilledStoryIds,
     errors,
   };
 }
