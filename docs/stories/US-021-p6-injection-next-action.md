@@ -2,7 +2,7 @@
 
 ## Status
 
-planned
+implemented
 
 ## Lane
 
@@ -53,4 +53,13 @@ None (presentation only).
 
 ## Evidence
 
-(pending implementation)
+`injectionMessage(state, session, drift)` exported from index.ts — leads with
+`[harness] next: <nextAction>.` from `readiness()`, drops the vanity-counts
+`durable layer: N intakes · stories · traces…` line entirely, keeps the
+actionable drift + trace nags, and returns `""` (quiet) when not set up or
+fully ready. **OQ-2 resolved:** the injection is the agent-facing per-turn
+surface, so it owns its own next-action line (the footer owns the human-facing
+one); counts belong in the dashboard Stats tab. Call site index.ts:~960 now
+passes `session`. p6 tests: 6 incl a regression sweep asserting no
+`[harness] durable layer:` lead across all session×drift permutations. tsc
+clean; p2 44 p3 33 p4 58 p5 34 p6 34; lens 0.

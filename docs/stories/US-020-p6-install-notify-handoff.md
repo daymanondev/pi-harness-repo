@@ -2,7 +2,7 @@
 
 ## Status
 
-planned
+implemented
 
 ## Lane
 
@@ -54,4 +54,11 @@ None (presentation only).
 
 ## Evidence
 
-(pending implementation)
+Pure `installNotifyText(session, driftCount)` exported from index.ts — sources
+the post-install message from `readiness()` (post-install invariant cli+db
+true → `firstUnmet` = intake). Wired at the install-success notify
+(index.ts:~755): `"repository-harness installed — next: <nextAction>"` (or
+`— ready`), replacing the bare `"installed — footer is live ✓"` that left the
+gate feeling ineffective. Failure path unchanged. p6 tests: 3 branches
+(intake handoff / drift handoff / ready). p3 install-route test updated to
+assert the handoff contract (33/33). tsc clean; lens 0.

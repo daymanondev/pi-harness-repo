@@ -154,16 +154,51 @@ export function renderFooter(
   return fg("accent", "🪢 ") + fg("warning", r.nextAction!);
 }
 
-/** Install-hint widget lines, or undefined when fully set up. */
-function hintLines(state: HarnessState): string[] | undefined {
-  if (state.cliInstalled && state.dbInitialized) return undefined;
+/** US-020: format the post-install notify from readiness(). Pure + testable.
+ *  After a successful install the cli+db are present, so the firstUnmet step
+ *  is `intake` (intake not recorded this session) → the notify hands off to
+ *  the next requirement instead of the bare "installed ✓" that left users
+ *  wondering why the gate still felt ineffective. */
+export function installNotifyText(
+  session: { intakeRecorded: boolean; traceRecorded: boolean },
+  driftCount: number
+): string {
+  const r = readiness(
+    { cliInstalled: true, dbInitialized: true }, // post-install invariant
+    { intakeRecorded: session.intakeRecorded, traceRecorded: session.traceRecorded },
+    driftCount
+  );
+  return r.nextAction
+    ? `repository-harness installed — next: ${r.nextAction}`
+    : "repository-harness installed — ready";
+}
+
+/** Install-hint widget lines, or undefined when fully set up.
+ *  US-019: once the DB is ready the widget becomes a persistent next-action
+ *  coach sourced from readiness() (it no longer vanishes), so the user always
+ *  sees the next step without opening the dashboard. */
+export function hintLines(
+  state: HarnessState,
+  drift: DriftRecord[],
+  session: { intakeRecorded: boolean; traceRecorded: boolean }
+): string[] | undefined {
   if (!state.cliInstalled) {
     return ["repository-harness not found in this repo.", "Run /harness to install it."];
   }
-  return [
-    "Harness CLI is installed but the database isn't initialized.",
-    "Run /harness to finish setup.",
-  ];
+  if (!state.dbInitialized) {
+    return [
+      "Harness CLI is installed but the database isn't initialized.",
+      "Run /harness to finish setup.",
+    ];
+  }
+  // DB ready → coach. Pure readiness() keeps the widget in lockstep with the
+  // footer (US-018) and notify/injection (US-020/021).
+  const r = readiness(
+    { cliInstalled: true, dbInitialized: true },
+    { intakeRecorded: session.intakeRecorded, traceRecorded: session.traceRecorded },
+    drift.length
+  );
+  return r.nextAction ? [`Harness: ${r.nextAction}.`] : undefined;
 }
 
 // ─── gate B′ (drift) ───────────────────────────────────────────────────────
@@ -202,33 +237,41 @@ async function gateDriftOnTrace(
 
 // ─── before_agent_start injection ──────────────────────────────────────────
 
-function injectionMessage(
+export function injectionMessage(
   state: HarnessState,
-  traceRecorded: boolean,
+  session: { intakeRecorded: boolean; traceRecorded: boolean },
   drift: DriftRecord[]
 ): string {
+  // Harness not set up → the footer/widget cover setup; the injection has no
+  // actionable counts for the agent yet, so stay quiet.
+  if (!(state.cliInstalled && state.dbInitialized)) return "";
+
+  // US-021 (OQ-2): the injection is the agent-facing per-turn surface. It leads
+  // with the next-required-action from readiness() and keeps only actionable
+  // nags (drift, trace). Vanity counts (intakes·stories·traces) belong in the
+  // dashboard Stats tab, not here — they were the "junk" the agent skimmed.
   const lines: string[] = [];
-  if (state.cliInstalled && state.dbInitialized) {
-    const s = state.stats;
+  const r = readiness(
+    { cliInstalled: true, dbInitialized: true },
+    { intakeRecorded: session.intakeRecorded, traceRecorded: session.traceRecorded },
+    drift.length
+  );
+  if (r.nextAction) {
+    lines.push(`[harness] next: ${r.nextAction}.`);
+  }
+  if (drift.length > 0) {
     lines.push(
-      `[harness] durable layer: ${s?.intakes ?? "?"} intakes · ` +
-        `${s?.stories ?? "?"} stories · ${s?.traces ?? "?"} traces · ` +
-        `${s?.decisions ?? "?"} decisions · ${s?.backlog_items ?? "?"} backlog.`
+      `[harness] ! ${drift.length} markdown↔durable drift detected ` +
+        `(${summarizeDrift(drift).ids}). audit cannot see this; sync before closing.`
     );
-    if (drift.length > 0) {
-      lines.push(
-        `[harness] ! ${drift.length} markdown↔durable drift detected ` +
-          `(${summarizeDrift(drift).ids}). audit cannot see this; sync before closing.`
-      );
-    }
-    if (!traceRecorded) {
-      lines.push(
-        `[harness] Done Definition requires a recorded trace before this task ` +
-          `is complete. No trace recorded this session. Run ` +
-          `\`scripts/bin/harness-cli trace --summary … --intake <id> ` +
-          `--read … --changed … --outcome …\`.`
-      );
-    }
+  }
+  if (!session.traceRecorded) {
+    lines.push(
+      `[harness] Done Definition requires a recorded trace before this task ` +
+        `is complete. No trace recorded this session. Run ` +
+        `\`scripts/bin/harness-cli trace --summary … --intake <id> ` +
+        `--read … --changed … --outcome …\`.`
+    );
   }
   return lines.join("\n");
 }
@@ -741,7 +784,20 @@ async function handleHarnessCommand(
       } catch {
         // footer refresh is best-effort
       }
-      ctx.ui.notify("repository-harness installed — footer is live ✓", "info");
+      const session = getSession(ctx.cwd);
+      try {
+        const fresh = await detectHarnessCached(ctx.cwd, exec, { signal: ctx.signal });
+        ctx.ui.setStatus(
+          STATUS_KEY,
+          renderFooter(fresh, driftCache.get(ctx.cwd) ?? [], session, fg)
+        );
+      } catch {
+        // footer refresh is best-effort
+      }
+      ctx.ui.notify(
+        installNotifyText(session, (driftCache.get(ctx.cwd) ?? []).length),
+        "info"
+      );
     }
   }
 }
@@ -813,7 +869,7 @@ export default function (pi: ExtensionAPI) {
       const session = getSession(ctx.cwd);
       ctx.ui.setStatus(STATUS_KEY, renderFooter(state, drift, session, fg));
 
-      const hint = hintLines(state);
+      const hint = hintLines(state, drift, session);
       ctx.ui.setWidget(WIDGET_KEY, hint, { placement: "belowEditor" });
 
       ctx.ui.setWidget(FRICTION_WIDGET_KEY, undefined);
@@ -944,7 +1000,7 @@ export default function (pi: ExtensionAPI) {
       ctx.ui.setStatus(STATUS_KEY, renderFooter(state, drift, session, fg));
     }
 
-    const msg = injectionMessage(state, session.traceRecorded, drift);
+    const msg = injectionMessage(state, session, drift);
     if (msg) {
       return {
         message: { customType: "harness", content: msg, display: true },

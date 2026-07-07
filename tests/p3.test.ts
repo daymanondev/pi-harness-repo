@@ -343,10 +343,11 @@ test("INSTALL route: confirm → runs installer + init + migrate, writes shim, n
     // shim step wrote AGENTS.md with the marker
     const agents = readFileSync(join(cwd, "AGENTS.md"), "utf8");
     assert.ok(agents.includes(HARNESS_BEGIN), "AGENTS.md shim marker must be written");
-    // success notify fired
+    // success notify fired — US-020: hands off to the next requirement
+    // (readiness-driven), not the bare 'footer is live ✓'.
     assert.ok(
-      notifies.some((n) => /installed — footer is live/.test(n.msg)),
-      `expected success notify; got: ${JSON.stringify(notifies)}`
+      notifies.some((n) => /repository-harness installed — (next: |ready)/.test(n.msg)),
+      `expected success handoff notify; got: ${JSON.stringify(notifies)}`
     );
   } finally {
     rmSync(cwd, { recursive: true, force: true });

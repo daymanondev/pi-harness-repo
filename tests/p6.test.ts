@@ -211,4 +211,152 @@ test("all clear → '🪢 ready' and NO vanity counts", () => {
   assert.ok(!/stories|traces|backlog/.test(out), "vanity counts must be gone from the footer");
 });
 
+console.log("=== US-019: hintLines becomes a persistent next-action coach ===");
+
+type HintLines = (
+  s: HarnessState,
+  drift: DriftRecord[],
+  session: { intakeRecorded: boolean; traceRecorded: boolean }
+) => string[] | undefined;
+let hintLines!: HintLines;
+const sess = (intake: boolean, trace: boolean) => ({
+  intakeRecorded: intake,
+  traceRecorded: trace,
+});
+/** Real-shaped drift record — summarizeDrift reads .storyId, so driftN's
+ *  undefined-filled array only works for .length consumers (footer). */
+const driftRec = (id: string): DriftRecord => ({
+  storyId: id,
+  durable: "planned",
+  markdown: "implemented",
+  kind: "status_mismatch",
+});
+const driftReal = (n: number): DriftRecord[] =>
+  Array.from({ length: n }, (_, i) => driftRec(`US-00${10 + i}`));
+
+test("hintLines is exported from index.ts", async () => {
+  const mod = await import("../extensions/harness/index.ts");
+  hintLines = mod.hintLines;
+  assert.equal(typeof hintLines, "function");
+});
+
+test("no cli → install lines (unchanged)", () => {
+  assert.deepEqual(hintLines(hstate({ cliInstalled: false }), [], sess(false, false)), [
+    "repository-harness not found in this repo.",
+    "Run /harness to install it.",
+  ]);
+});
+
+test("cli present, db missing → db-init lines (unchanged)", () => {
+  assert.deepEqual(hintLines(hstate({ dbInitialized: false }), [], sess(false, false)), [
+    "Harness CLI is installed but the database isn't initialized.",
+    "Run /harness to finish setup.",
+  ]);
+});
+
+test("US-019: db ready, no intake → persistent coach line (does NOT vanish)", () => {
+  const out = hintLines(hstate({}), driftN(0), sess(false, false));
+  assert.deepEqual(out, ["Harness: record an intake before editing."]);
+});
+
+test("US-019: db ready, intake ok, drift present → drift coach line", () => {
+  const out = hintLines(hstate({}), driftN(2), sess(true, false));
+  assert.deepEqual(out, ["Harness: 2 drift — sync markdown↔durable."]);
+});
+
+test("US-019: db ready, intake+drift ok, no trace → trace coach line", () => {
+  const out = hintLines(hstate({}), driftN(0), sess(true, false));
+  assert.deepEqual(out, ["Harness: record a trace when done."]);
+});
+
+test("US-019: all ready → undefined (cleared, no stale hint)", () => {
+  assert.equal(hintLines(hstate({}), driftN(0), sess(true, true)), undefined);
+});
+
+console.log("=== US-020: installNotifyText hands off to next requirement ===");
+
+type InstallNotifyText = (
+  session: { intakeRecorded: boolean; traceRecorded: boolean },
+  driftCount: number
+) => string;
+let installNotifyText!: InstallNotifyText;
+
+test("installNotifyText is exported from index.ts", async () => {
+  const mod = await import("../extensions/harness/index.ts");
+  installNotifyText = mod.installNotifyText;
+  assert.equal(typeof installNotifyText, "function");
+});
+
+test("US-020: post-install (intake not recorded) → hands off to intake step", () => {
+  assert.equal(
+    installNotifyText(sess(false, false), 0),
+    "repository-harness installed — next: record an intake before editing"
+  );
+  // must NOT be the bare 'installed ✓' that left the gate feeling ineffective
+  assert.ok(!/footer is live/.test(installNotifyText(sess(false, false), 0)));
+});
+
+test("US-020: post-install with drift → drift handoff", () => {
+  assert.equal(
+    installNotifyText(sess(true, false), 3),
+    "repository-harness installed — next: 3 drift — sync markdown↔durable"
+  );
+});
+
+test("US-020: post-install, everything ready → 'installed — ready'", () => {
+  assert.equal(installNotifyText(sess(true, true), 0), "repository-harness installed — ready");
+});
+
+console.log("=== US-021: injection leads with next-action, drops vanity counts ===");
+
+type InjectionMessage = (
+  s: HarnessState,
+  session: { intakeRecorded: boolean; traceRecorded: boolean },
+  drift: DriftRecord[]
+) => string;
+let injectionMessage!: InjectionMessage;
+
+test("injectionMessage is exported from index.ts", async () => {
+  const mod = await import("../extensions/harness/index.ts");
+  injectionMessage = mod.injectionMessage;
+  assert.equal(typeof injectionMessage, "function");
+});
+
+test("US-021: harness not set up → quiet (footer/widget cover setup)", () => {
+  assert.equal(injectionMessage(hstate({ cliInstalled: false }), sess(false, false), driftN(0)), "");
+});
+
+test("US-021: intake unmet → LEADS with next-action; no vanity counts; trace nag kept", () => {
+  const out = injectionMessage(hstate({}), sess(false, false), driftN(0));
+  assert.ok(out.startsWith("[harness] next: record an intake before editing."), out);
+  // vanity counts are gone from the lead
+  assert.ok(!/durable layer:|intakes ·|stories ·|traces ·/.test(out), out);
+  // trace nag still present (actionable)
+  assert.ok(/Done Definition requires a recorded trace/.test(out), out);
+});
+
+test("US-021: drift present, intake ok → drift next-action + drift nag", () => {
+  const out = injectionMessage(hstate({}), sess(true, false), driftReal(2));
+  assert.ok(out.startsWith("[harness] next: 2 drift — sync markdown↔durable."), out);
+  assert.ok(/markdown↔durable drift detected/.test(out), out);
+  assert.ok(!/durable layer:/.test(out), "vanity counts must be gone");
+});
+
+test("US-021: all ready → quiet (drops counts; footer already says ready)", () => {
+  assert.equal(injectionMessage(hstate({}), sess(true, true), driftN(0)), "");
+});
+
+test("US-021 regression: NO line ever starts with '[harness] durable layer:'", () => {
+  const sessions = [sess(false, false), sess(true, false), sess(true, true)];
+  for (const s of sessions) {
+    for (const d of [driftN(0), driftReal(2)]) {
+      const out = injectionMessage(hstate({}), s, d);
+      assert.ok(
+        !/^\[harness\] durable layer:/.test(out),
+        `vanity-count lead survived: ${out}`
+      );
+    }
+  }
+});
+
 await run();

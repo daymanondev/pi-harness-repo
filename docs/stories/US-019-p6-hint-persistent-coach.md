@@ -2,7 +2,7 @@
 
 ## Status
 
-planned
+implemented
 
 ## Lane
 
@@ -52,4 +52,10 @@ None (presentation only).
 
 ## Evidence
 
-(pending implementation)
+`hintLines(state, drift, session)` exported from index.ts — now consults
+`readiness()` once the DB is ready: returns `["Harness: <nextAction>."]` for
+any `firstUnmet` (intake/drift/trace) and `undefined` when ready (cleared, no
+stale hint). Install/db-init branches unchanged. Call site index.ts:~820
+threads `drift` + `session`. p6 tests: 5 hintLines branches (install, db-init,
+intake, drift, trace, ready→undefined). tsc clean; p2 44 p3 33 p4 58 p5 34
+p6 34; lens 0.
