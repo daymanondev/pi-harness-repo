@@ -2,7 +2,7 @@
 
 ## Status
 
-planned
+implemented
 
 ## Lane
 
@@ -80,10 +80,12 @@ reads. This slice closes that gap (Part C):
 - **Reuses US-023's advisory pattern:** age/staleness → advisory re-verify text,
   structurally identical to `nextActionFor`'s grill/implement prompt. The
   dashboard *routes*, the operator runs it — no ADR-0014 launch-surface change.
-- **OQ-1 (resolve at impl): new tab vs drill target.** The decisions view is
-  either a new tab (e.g. key `7`) or a drill-down from the stats-tab "decisions"
-  count. Either keeps the read-only invariant; pick whichever minimizes churn to
-  the existing tab-switch tests (AC5).
+- **OQ-1 RESOLVED: new tab (key `6`).** Added `decisions` as a 7th tab +
+  ListTab (cursor + drill). Chose new-tab over drill-from-stats-count because
+  stats is a non-list tab; converting it would risk AC5. Key `6` keeps `1-5`/`t`
+  mechanics byte-identical (only the footer hint label `[1-5,t]`→`[1-6,t]` and
+  one tab-strip assertion updated). Fetch sorts newest-first so the cursor index
+  matches the drill index (US-014 invariant).
 - **Parser resilience:** ADRs in-repo occasionally deviate from the template
   (e.g. merged/renamed sections). `parseAdr` must return whatever sections it
   finds and a safe fallback for the rest — never throw on a malformed file.
@@ -113,5 +115,14 @@ Verify command: `npx tsx tests/p4.test.ts && npx tsc --noEmit`.
 
 ## Evidence
 
-(none yet — planned. Fill on implementation: tsc result, p4 count delta,
-regression suite counts, read-only inspection note.)
+tsc clean (`npx tsc --noEmit`, exit 0 — extensions + tests). `tests/p4.test.ts`
+80 passed / 0 failed (+14 US-024 cases: `parseDecisionMeta` pipe-delimited +
+garbage; `parseAdrBody` full-section + missing-section + empty; `needsReverify`
+- `formatAdrAge`; nav `'6'` tab switch + decisions cursor/Enter-drill; decisions
+list render; empty + error degradation; detail title/status/age/advisory/excerpts;
+markdown-only ADR status fallback; wiring read/sort-newest-first/skip-README).
+Regression: p2 46, p3 33, p5 31, p6 36 — all 0 failed. Lens diagnostics 0
+errors. Read-only invariant verified (AC4): no `intake`/`story`/`trace`/
+`backlog`/`decision add|verify` write calls in the render path — `decision
+verify <id>` appears only as printed advisory text; `fetchDecisions` uses a
+read-only `query sql` + file reads. `story verify US-024` → pass.

@@ -22,7 +22,7 @@ import { type FgFn, BOX_WIDTH, box, isEnter, isEscape, padRight, truncateAnsi } 
 
 // ─── tabs ──────────────────────────────────────────────────────────────────
 
-export type DashboardTab = "matrix" | "stats" | "backlog" | "tools" | "drift" | "timeline";
+export type DashboardTab = "matrix" | "stats" | "backlog" | "tools" | "drift" | "timeline" | "decisions";
 
 /** Tab chrome definition: `key` is the single hotkey that activates the tab. */
 export const DASHBOARD_TABS: { tab: DashboardTab; label: string; key: string }[] = [
@@ -32,6 +32,7 @@ export const DASHBOARD_TABS: { tab: DashboardTab; label: string; key: string }[]
   { tab: "tools", label: "tools", key: "4" },
   { tab: "drift", label: "drift", key: "5" },
   { tab: "timeline", label: "timeline", key: "t" },
+  { tab: "decisions", label: "decisions", key: "6" },
 ];
 
 // ─── matrix parser (`query matrix --numeric`) ──────────────────────────────
@@ -316,7 +317,123 @@ export function timelineDiff(ev: TimelineEvent): { table: string; before: number
   return out;
 }
 
-// ─── dashboard data aggregate (all tabs) ───────────────────────────────────
+// ─── decisions parser (`query sql` + docs/decisions/*.md) (US-024) ────────
+
+/** Durable metadata for one ADR, parsed from the pipe-delimited `query sql`
+ *  projection of the `decision` table. The dashboard reads ADR *bodies* from
+ *  markdown (the durable layer is metadata-only by design — ADR-0004), so this
+ *  carries only the status + verify-age signal markdown cannot provide. */
+export interface DecisionMeta {
+  status: string;
+  lastVerifiedAt: string;
+  lastVerifiedResult: string;
+}
+
+/**
+ * Parse the pipe-delimited `query sql "SELECT id||'|'||title||'|'||status||'|'|
+ * COALESCE(last_verified_at,'')||'|'||COALESCE(last_verified_result,'') …"`
+ * output into a numId → meta map. The join key is the 4-digit ADR number: the
+ * durable `id` is inconsistent (`0009` vs `0009-p2-…`), so only the numeric
+ * prefix is stable across the table and the markdown filenames. Pure + total:
+ * lines that do not start with a 4-digit id (header, separator, blank) are
+ * skipped; never throws on partial/garbage output.
+ */
+export function parseDecisionMeta(stdout: string): Map<string, DecisionMeta> {
+  const out = new Map<string, DecisionMeta>();
+  for (const raw of stdout.split(/\r?\n/)) {
+    const line = raw.replace(/\s+$/, "");
+    if (!line) continue;
+    // <numId><slug>|<title>|<status>|<last_verified_at>|<last_verified_result>
+    const m = line.match(/^(\d{4})[a-z0-9-]*\|[^|]*\|([^|]*)\|([^|]*)\|([^|]*)$/);
+    if (!m) continue;
+    out.set(m[1]!, {
+      status: m[2]!.trim(),
+      lastVerifiedAt: m[3]!.trim(),
+      lastVerifiedResult: m[4]!.trim(),
+    });
+  }
+  return out;
+}
+
+/** The parsed body of one ADR markdown file. Each section string is the trimmed
+ *  body under its `## <heading>` (empty when absent — ADRs routinely omit
+ *  Follow-Up / Alternatives). `title` is the H1 minus any leading `<numId>`. */
+export interface AdrBody {
+  title: string;
+  status: string;
+  context: string;
+  decision: string;
+  alternatives: string;
+  consequences: string;
+  followUp: string;
+}
+
+/** First `# ` heading of a markdown doc, trimmed of the leading `#` and any
+ *  leading `<numId>` token (the template's H1 is `# 0010 <title>`). "" if none. */
+function parseAdrTitle(md: string): string {
+  const m = md.match(/^#\s+(.*)$/m);
+  if (!m) return "";
+  return m[1]!.trim().replace(/^\d{4}\s+/, "");
+}
+
+/**
+ * Pure ADR-body parser (US-024). Extracts the title (H1) + each `## <heading>`
+ * section via the shared `extractSection` helper. The single source of truth
+ * for body rendering; the detail pane only formats its output. Total: missing
+ * sections degrade to "" — never throws on a malformed/partial ADR.
+ */
+export function parseAdrBody(md: string): AdrBody {
+  return {
+    title: parseAdrTitle(md),
+    status: extractSection(md, "Status"),
+    context: extractSection(md, "Context"),
+    decision: extractSection(md, "Decision"),
+    alternatives: extractSection(md, "Alternatives Considered"),
+    consequences: extractSection(md, "Consequences"),
+    followUp: extractSection(md, "Follow-Up"),
+  };
+}
+
+/** One ADR as the dashboard consumes it: the readable body (markdown) joined to
+ *  the durable verify-age signal on the 4-digit number. */
+export interface AdrRow {
+  /** 4-digit ADR number, e.g. "0010" — canonical id, sort key, verify id. */
+  id: string;
+  /** Markdown filename, e.g. "0010-initiative-slices-workflow-model.md". */
+  filename: string;
+  /** Raw markdown body ("" only if the file was unreadable). */
+  body: string;
+  /** Durable status ("accepted"…) — "" when the ADR has no durable row. */
+  durableStatus: string;
+  /** `last_verified_at` from the durable layer — "" when never/untracked. */
+  lastVerifiedAt: string;
+}
+
+/** Re-verify advisory fires when an ADR was never verified (no durable
+ *  `last_verified_at`). Pure: trivially unit-testable. Age-based staleness is
+ *  deferred — no in-repo ADR has been verified yet, so any threshold would be
+ *  arbitrary until the first `decision verify` lands. */
+export function needsReverify(lastVerifiedAt: string): boolean {
+  return lastVerifiedAt.trim() === "";
+}
+
+/** Human verify-age for the detail view: "never" when blank, else "Nd ago" /
+ *  "today". Pure + total; a non-parseable timestamp degrades to "—". */
+export function formatAdrAge(lastVerifiedAt: string): string {
+  const s = lastVerifiedAt.trim();
+  if (!s) return "never";
+  // durable timestamps are sqlite datetime('now') → "YYYY-MM-DD HH:MM:SS"
+  const t = Date.parse(s.replace(" ", "T"));
+  if (!Number.isFinite(t)) return "—";
+  const days = Math.floor((Date.now() - t) / 86_400_000);
+  if (days <= 0) return "today";
+  if (days === 1) return "1d ago";
+  if (days < 30) return `${days}d ago`;
+  if (days < 365) return `${Math.floor(days / 30)}mo ago`;
+  return `${Math.floor(days / 365)}y ago`;
+}
+
+// ─── dashboard data aggregate (all tabs) ─────────────────────────────────────────────
 
 /**
  * All parsed tab data + a per-tab error map. Renderers are pure functions of
@@ -332,6 +449,8 @@ export interface DashboardData {
   drift: DriftRecord[];
   /** Last N observer events for the TIMELINE tab (US-015). */
   timeline: TimelineEvent[];
+  /** ADRs for the DECISIONS tab (US-024): markdown bodies + durable age. */
+  decisions: AdrRow[];
   /** storyId → packet file (filename + raw markdown), for the story detail pane. */
   packets: Record<string, PacketRef>;
   /** Story ids linked by a `spec_slice` intake = the grilled set (US-023).
@@ -393,7 +512,7 @@ export function nextActionFor(
 // ─── drill-down navigation (US-014) ────────────────────────────────────────
 
 /** Tabs whose body is a selectable list (cursor + drill apply). */
-export type ListTab = "matrix" | "backlog" | "drift" | "timeline";
+export type ListTab = "matrix" | "backlog" | "drift" | "timeline" | "decisions";
 
 /** Which list row is drilled open (kind = which list, index = row). */
 export interface DrillTarget {
@@ -422,9 +541,10 @@ const TAB_KEYS: Record<string, DashboardTab> = {
   "4": "tools",
   "5": "drift",
   t: "timeline",
+  "6": "decisions",
 };
 
-const LIST_TABS: ReadonlySet<ListTab> = new Set(["matrix", "backlog", "drift", "timeline"]);
+const LIST_TABS: ReadonlySet<ListTab> = new Set(["matrix", "backlog", "drift", "timeline", "decisions"]);
 
 function isListTab(tab: DashboardTab): tab is ListTab {
   return LIST_TABS.has(tab as ListTab);
@@ -478,7 +598,7 @@ function extractSection(text: string, heading: string): string {
 export function reduceDashboardNav(
   nav: DashboardNav,
   key: string,
-  lens: { matrix: number; backlog: number; drift: number; timeline: number }
+  lens: { matrix: number; backlog: number; drift: number; timeline: number; decisions: number }
 ): DashboardNavResult {
   if (isEscape(key)) {
     return nav.drill ? { nav: { ...nav, drill: null } } : { nav, action: "close" };
@@ -568,6 +688,8 @@ export function renderDashboardLines(
     content.push(...renderDriftTab(data, nav.cursor, fg, innerW));
   } else if (nav.tab === "timeline") {
     content.push(...renderTimelineTab(data, nav.cursor, fg, innerW));
+  } else if (nav.tab === "decisions") {
+    content.push(...renderDecisionsTab(data, nav.cursor, fg, innerW));
   }
   content.push("");
 
@@ -576,7 +698,7 @@ export function renderDashboardLines(
     dim(
       nav.drill
         ? "[Esc] back to list"
-        : "[↑↓/j,k] move · [Enter] open · [1-5,t] tabs · [r] refresh · [Esc] close"
+        : "[↑↓/j,k] move · [Enter] open · [1-6,t] tabs · [r] refresh · [Esc] close"
     )
   );
   return box("repository-harness · dashboard", content, fg, w);
@@ -860,6 +982,69 @@ function renderTimelineTab(data: DashboardData, cursor: number, fg: FgFn, innerW
   return out;
 }
 
+// ─── decisions render (US-024) ─────────────────────────────────────────────
+
+/** ADR status → color (vocab: proposed/accepted/superseded/rejected). */
+function decisionStatusColor(status: string): string {
+  if (status === "accepted") return "success";
+  if (status === "proposed") return "warning";
+  if (status === "superseded") return "dim";
+  if (status === "rejected") return "error";
+  return "dim"; // unknown / untracked — never throws
+}
+
+/** Render the DECISIONS tab body (US-024): the ADR list (id / title / status /
+ *  verify-age) with a selection cursor for drill-down. Source is markdown (where
+ *  the bodies live), enriched with durable status + age; fetch sorts newest-
+ *  first so the cursor index matches the drill index (US-014 invariant). */
+function renderDecisionsTab(
+  data: DashboardData,
+  cursor: number,
+  fg: FgFn,
+  innerW: number
+): string[] {
+  const dim = (t: string) => fg("dim", t);
+  if (data.errors.decisions) {
+    return [dim("(decisions unavailable — query sql or docs/decisions read failed)")];
+  }
+  const rows = data.decisions;
+  if (rows.length === 0) {
+    return [dim("(no decisions — docs/decisions/*.md is empty or absent)")];
+  }
+  const out: string[] = [];
+  const innerW2 = innerW - MARK_W;
+  const idW = 5;
+  const statusW = 10;
+  const ageW = 10;
+  const gap = 2;
+  const titleW = Math.max(12, innerW2 - (idW + statusW + ageW + 3 * gap));
+  out.push(
+    rowMarker(false) +
+      padRight(dim("id"), idW) +
+      gapSpaces(gap) +
+      padRight(dim("title"), titleW) +
+      gapSpaces(gap) +
+      padRight(dim("status"), statusW) +
+      gapSpaces(gap) +
+      dim("verified")
+  );
+  rows.forEach((r, i) => {
+    const body = parseAdrBody(r.body);
+    const status = r.durableStatus || body.status || "unknown";
+    out.push(
+      rowMarker(i === cursor) +
+        padRight(r.id, idW) +
+        gapSpaces(gap) +
+        padRight(truncateAnsi(body.title || r.filename, titleW), titleW) +
+        gapSpaces(gap) +
+        padRight(fg(decisionStatusColor(status), status), statusW) +
+        gapSpaces(gap) +
+        padRight(formatAdrAge(r.lastVerifiedAt), ageW)
+    );
+  });
+  return out;
+}
+
 // ─── detail panes (US-014 drill-down) ──────────────────────────────────────
 
 /** First N non-empty lines of a section body, each truncated to `width`. */
@@ -973,6 +1158,37 @@ function renderTimelineDetail(ev: TimelineEvent, fg: FgFn, innerW: number): stri
   return out;
 }
 
+/** Render the drilled DECISION detail (US-024): title + status/age + the
+ *  advisory re-verify line (mirrors US-023's next-action) + Context/Decision/
+ *  Consequences excerpts + the file path. Pure. */
+function renderAdrDetail(row: AdrRow, fg: FgFn, innerW: number): string[] {
+  const dim = (t: string) => fg("dim", t);
+  const out: string[] = [];
+  const body = parseAdrBody(row.body);
+  const status = row.durableStatus || body.status || "unknown";
+  const age = formatAdrAge(row.lastVerifiedAt);
+  out.push(`${fg("accent", row.id)}  ${truncateAnsi(body.title || row.filename, innerW - row.id.length - 2)}`);
+  out.push(`${dim("Status:")} ${fg(decisionStatusColor(status), status)}   ${dim("Verified:")} ${age === "never" ? fg("warning", age) : dim(age)}`);
+  // US-024 advisory re-verify — mirrors US-023's `→ next:` line. Warning when
+  // never verified (the actionable case); dim otherwise. Read-only: the
+  // operator runs the command; no durable write originates here (US-014).
+  out.push(`${needsReverify(row.lastVerifiedAt) ? fg("warning", "→ re-verify:") : dim("→ re-verify:")} run harness-cli decision verify ${row.id}`);
+  if (!row.body) {
+    out.push(dim(`(body unavailable — ${row.filename} unreadable)`));
+    return out;
+  }
+  out.push(dim("File: " + truncateAnsi(row.filename, innerW - 6)));
+  const section = (label: string, text: string, n: number): void => {
+    if (!text) return;
+    out.push(dim(label + ":"));
+    out.push(...sectionLines(text, n, innerW - 2, fg));
+  };
+  section("Context", body.context, 3);
+  section("Decision", body.decision, 3);
+  section("Consequences", body.consequences, 2);
+  return out;
+}
+
 /** Dispatch a drilled target to its detail renderer (bounds-checked). */
 function renderDetail(
   drill: DrillTarget,
@@ -994,6 +1210,11 @@ function renderDetail(
     const ev = data.timeline[drill.index];
     if (!ev) return [fg("dim", "(row no longer exists — press r to refresh)")];
     return renderTimelineDetail(ev, fg, innerW);
+  }
+  if (drill.kind === "decisions") {
+    const row = data.decisions[drill.index];
+    if (!row) return [fg("dim", "(row no longer exists — press r to refresh)")];
+    return renderAdrDetail(row, fg, innerW);
   }
   const rec = data.drift[drill.index];
   if (!rec) return [fg("dim", "(row no longer exists — press r to refresh)")];

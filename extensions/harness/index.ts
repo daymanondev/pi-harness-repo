@@ -61,6 +61,7 @@ import {
   parseGrilledStoryIds,
   parseStats,
   parseBacklogOpen,
+  parseDecisionMeta,
   parseToolsJson,
   readTimelineTail,
   reduceDashboardNav,
@@ -71,7 +72,9 @@ import {
   type MatrixRow,
   type PacketRef,
   type StatsCounts,
+  type AdrRow,
   type BacklogRow,
+  type DecisionMeta,
   type ToolRow,
   type TimelineEvent,
   ZERO_STATS,
@@ -327,7 +330,7 @@ class HarnessOverlayComponent {
     this.fg = o.fg;
     this.onDone = o.onDone;
     this.nav = { tab: o.tab ?? "matrix", cursor: 0, drill: null };
-    this.data = o.data ?? { matrix: [], stats: ZERO_STATS, backlog: [], tools: [], drift: [], timeline: [], packets: {}, grilledStoryIds: new Set(), errors: {} };
+    this.data = o.data ?? { matrix: [], stats: ZERO_STATS, backlog: [], tools: [], drift: [], timeline: [], decisions: [], packets: {}, grilledStoryIds: new Set(), errors: {} };
   }
 
   handleInput(data: string): void {
@@ -352,6 +355,7 @@ class HarnessOverlayComponent {
       backlog: this.data.backlog.length,
       drift: this.data.drift.length,
       timeline: this.data.timeline.length,
+      decisions: this.data.decisions.length,
     };
     const res = reduceDashboardNav(this.nav, data, lens);
     this.nav = res.nav;
@@ -589,6 +593,59 @@ async function fetchTimeline(
   }
 }
 
+/** Fetch ADRs for the DECISIONS tab (US-024). Source is `docs/decisions/*.md`
+ *  (where the bodies live), enriched with durable status + verify-age from the
+ *  `decision` table via a pipe-delimited `query sql` (joined on the 4-digit
+ *  number — the durable `id` is inconsistent). Durable lookup is best-effort:
+ *  an absent/unreadable db leaves `meta` empty so the markdown list still
+ *  renders. Returns null only when the markdown dir itself is unreadable so the
+ *  tab degrades to a dim error row. Sorted newest-first so the cursor index
+ *  matches the drill index (US-014 invariant). */
+async function fetchDecisions(
+  pi: ExtensionAPI,
+  ctx: ExtensionCommandContext
+): Promise<AdrRow[] | null> {
+  try {
+    const dir = join(ctx.cwd, "docs", "decisions");
+    const entries = await readdir(dir);
+    // durable metadata map (numId → meta); best-effort — absent/failed ⇒ {}
+    let meta: Map<string, DecisionMeta> = new Map();
+    try {
+      const bin = cliBinaryPath(ctx.cwd);
+      const res = await pi.exec(
+        bin,
+        [
+          "query", "sql",
+          "SELECT id || '|' || status || '|' || COALESCE(last_verified_at,'') || '|' || COALESCE(last_verified_result,'') FROM decision",
+        ],
+        { cwd: ctx.cwd, signal: ctx.signal, timeout: 5_000 }
+      );
+      if (res.code === 0) meta = parseDecisionMeta(res.stdout);
+    } catch {
+      // durable lookup is best-effort; markdown list still renders
+    }
+    const out: AdrRow[] = [];
+    for (const name of entries) {
+      const m = name.match(/^(\d{4})/);
+      if (!m) continue; // skip README.md + non-ADR files
+      const numId = m[1]!;
+      const body = await readFile(join(dir, name), "utf8");
+      const d = meta.get(numId);
+      out.push({
+        id: numId,
+        filename: name,
+        body,
+        durableStatus: d?.status ?? "",
+        lastVerifiedAt: d?.lastVerifiedAt ?? "",
+      });
+    }
+    out.sort((a, b) => b.id.localeCompare(a.id));
+    return out;
+  } catch {
+    return null;
+  }
+}
+
 /** Fetch all DASHBOARD tab data in parallel and build the DashboardData the
  *  renderer consumes. A null result on a tab records an error so that tab
  *  renders a dim error row; `matrix` keeps US-010's empty-on-failure shape. */
@@ -596,7 +653,7 @@ async function fetchDashboardData(
   pi: ExtensionAPI,
   ctx: ExtensionCommandContext
 ): Promise<DashboardData> {
-  const [matrix, stats, backlog, tools, drift, packets, timeline, grilledStoryIds] = await Promise.all([
+  const [matrix, stats, backlog, tools, drift, packets, timeline, grilledStoryIds, decisions] = await Promise.all([
     fetchMatrix(pi, ctx),
     fetchStatsCounts(pi, ctx),
     fetchBacklogRows(pi, ctx),
@@ -605,6 +662,7 @@ async function fetchDashboardData(
     fetchPackets(pi, ctx),
     fetchTimeline(pi, ctx),
     fetchGrilledStoryIds(pi, ctx),
+    fetchDecisions(pi, ctx),
   ]);
   const errors: Partial<Record<DashboardTab, string>> = {};
   if (stats === null) errors.stats = "stats";
@@ -612,6 +670,7 @@ async function fetchDashboardData(
   if (tools === null) errors.tools = "tools";
   if (drift === null) errors.drift = "drift";
   if (timeline === null) errors.timeline = "timeline";
+  if (decisions === null) errors.decisions = "decisions";
   return {
     matrix,
     stats: stats ?? ZERO_STATS,
@@ -619,6 +678,7 @@ async function fetchDashboardData(
     tools: tools ?? [],
     drift: drift ?? [],
     timeline: timeline ?? [],
+    decisions: decisions ?? [],
     packets,
     grilledStoryIds,
     errors,

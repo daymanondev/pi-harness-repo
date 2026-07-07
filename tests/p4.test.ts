@@ -21,10 +21,14 @@ import {
   parseGrilledStoryIds,
   parseStats,
   parseBacklogOpen,
+  parseDecisionMeta,
   parseToolsJson,
+  parseAdrBody,
   reduceDashboardNav,
   renderDashboardLines,
   nextActionFor,
+  needsReverify,
+  formatAdrAge,
   ZERO_STATS,
   type DashboardData,
   type DashboardNav,
@@ -73,7 +77,7 @@ const id = (_c: string, t: string) => t; // identity fg for plain-text assertion
 
 /** Build a DashboardData with empty defaults, overridden by `over`. */
 function dashData(over: Partial<DashboardData> = {}): DashboardData {
-  return { matrix: [], stats: ZERO_STATS, backlog: [], tools: [], drift: [], timeline: [], packets: {}, grilledStoryIds: new Set(), errors: {}, ...over };
+  return { matrix: [], stats: ZERO_STATS, backlog: [], tools: [], drift: [], timeline: [], decisions: [], packets: {}, grilledStoryIds: new Set(), errors: {}, ...over };
 }
 
 /** Build a DashboardNav for render assertions (cursor + drill default off). */
@@ -259,7 +263,7 @@ test("renders title, detected-state header, tab strip, footer hints", () => {
   assert.match(text, /db ok/);
   assert.match(text, /1 matrix/);
   assert.match(text, /2 stats.*3 backlog.*4 tools.*5 drift.*t timeline/);
-  assert.match(text, /\[1-5,t\] tabs.*\[r\] refresh.*\[Esc\] close/);
+  assert.match(text, /\[1-6,t\] tabs.*\[r\] refresh.*\[Esc\] close/);
 });
 test("matrix tab lists every story row with status + id", () => {
   const text = renderDashboardLines(bareState(), nav("matrix"), dashData({ matrix: parseMatrixNumeric(FIXTURE_MATRIX) }), id).join("\n");
@@ -420,7 +424,7 @@ test("timeline tab renders its empty-state (no longer the P5 placeholder)", () =
 // ─── drill-down: nav reducer + detail panes (US-014) ─────────────────────
 
 console.log("=== dashboard: reduceDashboardNav (pure) ===");
-const LENS = (m: number, b: number, d: number, t = 0) => ({ matrix: m, backlog: b, drift: d, timeline: t });
+const LENS = (m: number, b: number, d: number, t = 0, dec = 0) => ({ matrix: m, backlog: b, drift: d, timeline: t, decisions: dec });
 
 test("reducer: ↓/j moves cursor down, clamped to list length-1", () => {
   const start: DashboardNav = { tab: "matrix", cursor: 0, drill: null };
@@ -893,6 +897,183 @@ test("failing backlog query (exit 1) → backlog tab shows a dim error row, neve
     await registeredCommands.get("harness")!("", ctx as never); // must not throw
     const backlogRender = state.renders[0]![1]!;
     assert.match(backlogRender, /backlog unavailable/, "backlog tab degrades to error row");
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+// ─── US-024: decisions tab — ADR reader ────────────────────────────────────
+
+console.log("=== dashboard: US-024 decisions ADR reader ===");
+
+const ADR_0010 =
+  "# 0010 Workflow model — initiative + vertical slices\n\n" +
+  "Date: 2026-07-06\n\n" +
+  "## Status\n\nAccepted\n\n" +
+  "## Context\n\nOne line context.\n\nSecond line.\n\n" +
+  "## Decision\n\nDecided to adopt slices.\n\n" +
+  "## Alternatives Considered\n\n1. Intake everything upfront.\n\n" +
+  "## Consequences\n\nPositive:\n\n- Fits the budget.\n\n" +
+  "## Follow-Up\n\n- Kicker skill.\n";
+
+// minimal ADR missing the optional sections (Alternatives/Consequences/Follow-Up)
+const ADR_MINIMAL =
+  "# 0099 Tiny choice\n\n## Status\n\nProposed\n\n## Context\n\nWhy.\n\n## Decision\n\nDo it.\n";
+
+const DECISIONS_SQL =
+  "row\n" +
+  "----\n" +
+  "0008-dual-identity-in-place-build|Build pi-harness in-place|accepted||\n" +
+  "0009|P2 gate scope|accepted||\n" +
+  "0010-initiative-slices|Workflow model|accepted||\n";
+
+test("parseDecisionMeta: pipe-delimited rows → numId→meta map (joins on 4-digit number)", () => {
+  const m = parseDecisionMeta(DECISIONS_SQL);
+  assert.deepEqual(m.get("0008"), { status: "accepted", lastVerifiedAt: "", lastVerifiedResult: "" });
+  assert.deepEqual(m.get("0009"), { status: "accepted", lastVerifiedAt: "", lastVerifiedResult: "" });
+  assert.deepEqual(m.get("0010"), { status: "accepted", lastVerifiedAt: "", lastVerifiedResult: "" });
+  assert.equal(m.has("0001"), false, "absent ADR is simply missing, not synthesized");
+});
+
+test("parseDecisionMeta: header/separator/blank/garbage skipped, never throws", () => {
+  assert.equal(parseDecisionMeta("").size, 0);
+  assert.equal(parseDecisionMeta("row\n----\n").size, 0);
+  assert.equal(parseDecisionMeta("not a row at all\n").size, 0);
+});
+
+test("parseAdrBody: extracts title (H1 minus numId) + every section", () => {
+  const b = parseAdrBody(ADR_0010);
+  assert.equal(b.title, "Workflow model — initiative + vertical slices");
+  assert.equal(b.status, "Accepted");
+  assert.equal(b.context, "One line context.\n\nSecond line.");
+  assert.equal(b.decision, "Decided to adopt slices.");
+  assert.equal(b.alternatives, "1. Intake everything upfront.");
+  assert.ok(b.consequences.includes("Fits the budget."));
+  assert.equal(b.followUp, "- Kicker skill.");
+});
+
+test("parseAdrBody: missing optional sections degrade to '' (never throws)", () => {
+  const b = parseAdrBody(ADR_MINIMAL);
+  assert.equal(b.title, "Tiny choice");
+  assert.equal(b.status, "Proposed");
+  assert.equal(b.decision, "Do it.");
+  assert.equal(b.alternatives, "");
+  assert.equal(b.consequences, "");
+  assert.equal(b.followUp, "");
+});
+
+test("parseAdrBody: empty/garbage markdown → all empty fields", () => {
+  const e = parseAdrBody("");
+  assert.equal(e.title, "");
+  assert.equal(e.decision, "");
+  const g = parseAdrBody("just prose, no headings\n");
+  assert.equal(g.title, "");
+  assert.equal(g.context, "");
+});
+
+test("needsReverify: true when blank; false when a timestamp is present", () => {
+  assert.equal(needsReverify(""), true);
+  assert.equal(needsReverify("   "), true);
+  assert.equal(needsReverify("2026-07-06 12:00:00"), false);
+});
+
+test("formatAdrAge: never / today / — on garbage", () => {
+  assert.equal(formatAdrAge(""), "never");
+  assert.equal(formatAdrAge("not-a-date"), "—");
+  const iso = new Date().toISOString().slice(0, 19).replace("T", " ");
+  assert.equal(formatAdrAge(iso), "today");
+});
+
+test("reducer: '6' switches to decisions tab (resets cursor + drill)", () => {
+  const start: DashboardNav = { tab: "matrix", cursor: 2, drill: { kind: "matrix", index: 2 } };
+  const r = reduceDashboardNav(start, "6", LENS(0, 0, 0)).nav;
+  assert.equal(r.tab, "decisions");
+  assert.equal(r.cursor, 0);
+  assert.equal(r.drill, null);
+});
+
+test("reducer: decisions is a list tab — cursor moves + Enter drills", () => {
+  const base: DashboardNav = { tab: "decisions", cursor: 0, drill: null };
+  const down = reduceDashboardNav(base, "j", LENS(0, 0, 0, 0, 3)).nav;
+  assert.equal(down.cursor, 1);
+  const drill = reduceDashboardNav(down, "\r", LENS(0, 0, 0, 0, 3)).nav;
+  assert.deepEqual(drill.drill, { kind: "decisions", index: 1 });
+});
+
+test("decisions tab: lists ADR rows with id/title/status/verified", () => {
+  const data = dashData({
+    decisions: [
+      { id: "0009", filename: "0009-p2.md", body: ADR_MINIMAL, durableStatus: "accepted", lastVerifiedAt: "" },
+      { id: "0010", filename: "0010-init.md", body: ADR_0010, durableStatus: "accepted", lastVerifiedAt: "" },
+    ],
+  });
+  const text = renderDashboardLines(bareState(), nav("decisions"), data, id).join("\n");
+  assert.match(text, /0010/);
+  assert.match(text, /Workflow model/);
+  assert.match(text, /0009/);
+  assert.match(text, /accepted/);
+  assert.match(text, /verified/);
+});
+
+test("decisions tab: empty + error states degrade cleanly", () => {
+  const empty = renderDashboardLines(bareState(), nav("decisions"), dashData({ decisions: [] }), id).join("\n");
+  assert.match(empty, /no decisions/);
+  const err = renderDashboardLines(bareState(), nav("decisions"), dashData({ decisions: [], errors: { decisions: "decisions" } }), id).join("\n");
+  assert.match(err, /decisions unavailable/);
+});
+
+test("decisions detail: title + status/age + advisory re-verify + body excerpts", () => {
+  const data = dashData({
+    decisions: [
+      { id: "0010", filename: "0010-initiative-slices.md", body: ADR_0010, durableStatus: "accepted", lastVerifiedAt: "" },
+    ],
+  });
+  const text = renderDashboardLines(bareState(), nav("decisions", 0, { kind: "decisions", index: 0 }), data, id).join("\n");
+  assert.match(text, /0010/);
+  assert.match(text, /Workflow model/);
+  assert.match(text, /Status:.*accepted/);
+  assert.match(text, /Verified:.*never/);
+  assert.match(text, /re-verify:.*decision verify 0010/);
+  assert.match(text, /Context:/);
+  assert.match(text, /Decided to adopt slices/);
+  assert.match(text, /Decision:/);
+});
+
+test("decisions detail: markdown-only ADR (no durable row) uses markdown status + still advises re-verify", () => {
+  const data = dashData({
+    decisions: [
+      { id: "0099", filename: "0099-tiny.md", body: ADR_MINIMAL, durableStatus: "", lastVerifiedAt: "" },
+    ],
+  });
+  const text = renderDashboardLines(bareState(), nav("decisions", 0, { kind: "decisions", index: 0 }), data, id).join("\n");
+  assert.match(text, /Status:.*Proposed/, "status falls back to the markdown section");
+  assert.match(text, /Verified:.*never/);
+  assert.match(text, /decision verify 0099/);
+});
+
+test("wiring: decisions tab reads docs/decisions/*.md, sorts newest-first, skips README (US-024)", async () => {
+  const mod = await import("../extensions/harness/index.ts");
+  const cwd = installedRepo();
+  mkdirSync(join(cwd, "docs", "decisions"), { recursive: true });
+  writeFileSync(
+    join(cwd, "docs", "decisions", "0010-initiative-slices.md"),
+    "# 0010 Workflow model — slices\n\n## Status\n\nAccepted\n\n## Decision\n\nAdopt slices.\n"
+  );
+  writeFileSync(
+    join(cwd, "docs", "decisions", "0009-p2-gate.md"),
+    "# 0009 P2 gate scope\n\n## Status\n\nAccepted\n\n## Decision\n\nNarrow scope.\n"
+  );
+  writeFileSync(join(cwd, "docs", "decisions", "README.md"), "# decisions index\n");
+  try {
+    const { pi, ctx, state, registeredCommands } = mockHarness(cwd, { keySeqs: [["6", "\u001b"]] });
+    mod.default(pi as never);
+    await registeredCommands.get("harness")!("", ctx as never);
+    const decisionsRender = state.renders[0]![1]!;
+    assert.match(decisionsRender, /0010.*Workflow model/);
+    assert.match(decisionsRender, /0009.*P2 gate scope/);
+    assert.ok(decisionsRender.indexOf("0010") < decisionsRender.indexOf("0009"), "newest ADR (0010) renders above 0009");
+    assert.ok(!/decisions index/.test(decisionsRender), "README.md is skipped, not listed");
+    assert.match(decisionsRender, /Accepted/, "markdown-only ADR status renders");
   } finally {
     rmSync(cwd, { recursive: true, force: true });
   }

@@ -74,6 +74,7 @@ function dataWith(events: TimelineEvent[], over: Partial<DashboardData> = {}): D
     tools: [],
     drift: [],
     timeline: events,
+    decisions: [],
     packets: {},
     grilledStoryIds: new Set(),
     errors: {},
@@ -253,7 +254,7 @@ test("multiple changed tables all surface", () => {
 
 console.log("=== nav: timeline cursor + drill ===");
 
-const LENS = { matrix: 0, backlog: 0, drift: 0, timeline: 3 };
+const LENS = { matrix: 0, backlog: 0, drift: 0, timeline: 3, decisions: 0 };
 
 test("'t' switches to the timeline tab (resets cursor + drill)", () => {
   const res = reduceDashboardNav({ tab: "matrix", cursor: 5, drill: null }, "t", LENS);
