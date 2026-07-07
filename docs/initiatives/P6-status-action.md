@@ -1,6 +1,7 @@
 # Initiative: P6 — status surfaces show NEXT ACTION, not vanity counts
 
 - **Umbrella intake:** #23 (new_initiative, lane normal)
+- **Status:** M1–M4 implemented — US-018 (footer + `readiness()`), US-019 (hint widget), US-020 (install-notify), US-021 (injection). Residual: the `before_agent_start` trigger cannot distinguish chat turns from editing turns, so the trace/intake nags still fire on chat when a session owes them — see US-022 (Option C).
 - **Touching:** P1 footer/widget surfaces + P2 gate *communication* (not logic)
 - **Closes:** the "Gate A seems ineffective" confusion + the "footer counts are junk" complaint
 
