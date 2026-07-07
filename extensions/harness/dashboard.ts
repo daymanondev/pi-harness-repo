@@ -278,6 +278,18 @@ export function parseEventsJsonl(text: string): TimelineEvent[] {
   return out;
 }
 
+/** Re-derive the rendered timeline tail from raw events.jsonl text (US-016).
+ *  Pure + total: parse + cap to the last TIMELINE_MAX. Both the initial fetch
+ *  (`fetchTimeline`) and the live-tail watcher (`refreshTimelineTail`) route
+ *  through this single seam, so a coalesced burst of `fs.watch` events can
+ *  never duplicate or drop a row — every update is a fresh idempotent
+ *  re-derivation from the *current* file contents, never an incremental
+ *  append onto a stale list. Returning `[]` on empty/garbage is correct: the
+ *  renderer then shows the "no events" dim row. */
+export function readTimelineTail(text: string): TimelineEvent[] {
+  return parseEventsJsonl(text).slice(-TIMELINE_MAX);
+}
+
 /** The changed-table delta for an event: only tables where before ≠ after
  *  (reads / `--version` yield [] since both maps are empty or equal). This is
  *  the `intake: 2 → 3` headline the timeline exists to surface. */

@@ -39,10 +39,14 @@ an inbound harness tool — exactly as its semantics require.
 2. **Live tail** — the payoff (§8.3). The timeline appends new events in real
    time as the agent makes harness-cli calls, via `fs.watch` on `events.jsonl`
    - async re-render. This is what turns "learn how the agent uses harness"
-   into a visible loop. **Make/break depends on OQ-4** (whether
-   `ctx.ui.custom` re-renders on an externally-triggered `invalidate()`); if it
-   does not, degrades to a documented fallback (poll / refresh-on-return) — do
-   not force an unstable watcher.
+   into a visible loop. **🛑 BLOCKED (US-016 deferred):** the live tail's
+   plumbing landed (`readTimelineTail` + a gated watcher), but the background
+   file-watch **froze the DASHBOARD** in the real TUI (`fs.watch` confirmed;
+   `fs.watchFile` inconclusive). The watcher is DISABLED (`LIVE_TAIL_ENABLED =
+   false`); the overlay reverts to US-015 manual-`r` behavior. Re-enable is
+   backlog #7 — isolate why any background file-watch wedges pi's raw-stdin
+   overlay. The pure `readTimelineTail` re-derives the
+   tail idempotently on every watcher fire (no dup/drop).
 
 3. **Observer onboarding** — the adopt path (§8.1). When `observerInstalled`
    is false, the dashboard shows a one-line prompt + an `o` key that runs the
@@ -86,6 +90,14 @@ an inbound harness tool — exactly as its semantics require.
    re-opens via a `do { … } while (refresh)` loop (`index.ts`). Probe the
    `@earendil-works/pi-tui` Component contract before building the watcher; if
    unsupported, document the fallback. Resolve at M2.
+
+   **🟡 PARTIAL (US-016 / decision 0013):** the *source-level* probe came back
+   positive — `TUI.requestRender()` is public and `ctx.ui.custom` hands the
+   component the `tui` instance, so an async callback *should* be able to
+   re-render. **But this was never verified end-to-end in the real TUI**, because
+   the file-watch primitive that would drive it froze the overlay first. The
+   OQ-4 re-render seam is plausible-but-unverified; the blocker is the
+   file-watch freeze (backlog #7), not the re-render contract.
 
 ## Out of scope (confirmed during grill)
 

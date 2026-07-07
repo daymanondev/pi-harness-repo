@@ -12,11 +12,12 @@
 //      LLM. fetchTimeline reads the fixture file directly (no exec mock needed).
 
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, appendFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   parseEventsJsonl,
+  readTimelineTail,
   timelineDiff,
   reduceDashboardNav,
   renderDashboardLines,
@@ -150,6 +151,60 @@ test("db_before/after non-numeric values are dropped by toCounts", () => {
   );
   assert.deepEqual(ev.dbBefore, { story: 5 }, "string entry dropped");
   assert.deepEqual(ev.dbAfter, { story: 6 }, "null entry dropped");
+});
+
+// ─── layer 1: readTimelineTail (US-016 live-tail re-derivation seam) ────────
+
+console.log("=== readTimelineTail ===");
+
+/** Build N synthetic mutation events (i:N). */
+function events(n: number): string {
+  const lines: string[] = [];
+  for (let i = 1; i <= n; i++) {
+    lines.push(jl({ ts: `2026-07-04T10:1${i}:00+00:00`, cmd: ["intake"], exit: 0, duration_ms: 10, stdout: `Intake #${i}`, stderr: "", db_before: { intake: i - 1 }, db_after: { intake: i } }));
+  }
+  return lines.join("\n");
+}
+
+test("empty / garbage text → []", () => {
+  assert.deepEqual(readTimelineTail(""), []);
+  assert.deepEqual(readTimelineTail("not json\n{broken"), []);
+});
+
+test("under the cap returns every event in order", () => {
+  const tail = readTimelineTail(events(3));
+  assert.equal(tail.length, 3);
+  assert.equal(tail[0]!.stdout, "Intake #1");
+  assert.equal(tail[2]!.stdout, "Intake #3");
+});
+
+test("over the cap drops the OLDEST and keeps the last TIMELINE_MAX", () => {
+  const tail = readTimelineTail(events(TIMELINE_MAX + 5));
+  assert.equal(tail.length, TIMELINE_MAX);
+  assert.equal(tail[0]!.stdout, "Intake #6", "oldest 5 dropped");
+  assert.equal(tail[tail.length - 1]!.stdout, `Intake #${TIMELINE_MAX + 5}`);
+});
+
+test("appending a line re-derives the tail with no duplicate or dropped row (watcher fire)", () => {
+  // Simulate the live-tail contract: the watcher fires after an append, and the
+  // handler re-derives from the CURRENT file contents (not an incremental
+  // append onto a stale list). Two re-derivations from the same grown file are
+  // identical ⇒ idempotent ⇒ no dup, no drop, even if the watcher coalesces.
+  const before = events(3);
+  const appended = before + "\n" + jl({ ts: "2026-07-04T10:20:00+00:00", cmd: ["trace"], exit: 0, duration_ms: 9, stdout: "Trace #4 recorded.", stderr: "", db_before: { trace: 3 }, db_after: { trace: 4 } });
+  const t1 = readTimelineTail(appended);
+  const t2 = readTimelineTail(appended); // coalesced re-fire → same input
+  assert.equal(t1.length, 4);
+  assert.deepEqual(t1, t2, "re-derivation is idempotent (no dup on coalesce)");
+  assert.equal(t1[3]!.stdout, "Trace #4 recorded.", "appended event surfaces");
+  assert.equal(t1[0]!.stdout, "Intake #1", "no pre-existing row dropped while under cap");
+});
+
+test("cap boundary: exactly TIMELINE_MAX keeps all; +1 drops the first", () => {
+  assert.equal(readTimelineTail(events(TIMELINE_MAX)).length, TIMELINE_MAX);
+  const over = readTimelineTail(events(TIMELINE_MAX + 1));
+  assert.equal(over.length, TIMELINE_MAX);
+  assert.equal(over[0]!.stdout, "Intake #2", "first dropped when one over");
 });
 
 // ─── layer 1: timelineDiff ─────────────────────────────────────────────────
@@ -379,7 +434,21 @@ const WIRED_STATS =
 /** Minimal mock ExtensionAPI + ctx (modeled on tests/p4.test.ts). `keySeqs[i]`
  *  is the key sequence driven on the i-th ctx.ui.custom call. */
 function mockHarness(cwd: string, keySeqs: string[][] = [["\u001b"]]) {
-  const state = { customCalls: 0, renders: [] as string[][] };
+  const state = {
+    customCalls: 0,
+    renders: [] as string[][],
+    /** # of times the live-tail watcher entry asked the TUI to re-render. */
+    requestRenderCalls: 0,
+    /** Last overlay component (US-016: so tests can drive refreshTimelineTail). */
+    lastComponent: undefined as
+      | undefined
+      | {
+          render?(w: number): string[];
+          handleInput?(d: string): void;
+          refreshTimelineTail(): Promise<void>;
+          dispose?(): void;
+        },
+  };
   let seqIdx = 0;
   const registeredCommands = new Map<string, (a: string, c: unknown) => Promise<void>>();
   const pi = {
@@ -396,6 +465,8 @@ function mockHarness(cwd: string, keySeqs: string[][] = [["\u001b"]]) {
       return { stdout: "", stderr: "", code: 0, killed: false };
     },
   };
+  /** Mock pi-tui TUI: requestRender is the live-tail re-render lever (OQ-4). */
+  const tui = { requestRender: () => { state.requestRenderCalls++; } };
   const ctx = {
     cwd,
     signal: undefined as AbortSignal | undefined,
@@ -407,13 +478,15 @@ function mockHarness(cwd: string, keySeqs: string[][] = [["\u001b"]]) {
       setStatus() {},
       custom: async (
         factory: (t: unknown, th: unknown, kb: unknown, done: (r: unknown) => void) => {
-          handleInput?(d: string): void; render?(w: number): string[];
+          handleInput?(d: string): void; render?(w: number): string[]; dispose?(): void;
         }
       ) => {
         state.customCalls++;
         let result: unknown;
-        const done = (r: unknown) => { result = r; };
-        const comp = factory({}, { fg: (_c: string, t: string) => t }, {}, done);
+        let closedByComponent = false;
+        const done = (r: unknown) => { result = r; closedByComponent = true; };
+        const comp = factory(tui, { fg: (_c: string, t: string) => t }, {}, done);
+        state.lastComponent = comp as typeof state.lastComponent;
         const renders: string[] = [];
         if (typeof comp.render === "function") renders.push(comp.render(76).join("\n"));
         const seq = keySeqs[seqIdx++] ?? ["\u001b"];
@@ -422,8 +495,16 @@ function mockHarness(cwd: string, keySeqs: string[][] = [["\u001b"]]) {
           if (result !== undefined) break;
           if (typeof comp.render === "function") renders.push(comp.render(76).join("\n"));
         }
+        // Faithful to the real showExtensionCustom.close(): dispose ONLY when
+        // the component actually closed itself (Esc/refresh/install). When the
+        // key sequence ends open, return a harmless `close` so the handler's
+        // do/while exits cleanly, but leave the component alive + undisposed so
+        // live-tail tests can drive refreshTimelineTail then dispose() itself.
+        if (closedByComponent) {
+          try { comp.dispose?.(); } catch { /* ignore */ }
+        }
         state.renders.push(renders);
-        return result;
+        return result ?? { action: "close" };
       },
     },
   };
@@ -490,6 +571,80 @@ test("wired: missing events.jsonl → timeline tab degrades to a dim message", a
     const renders = state.renders[0]!;
     const tl = renders[renders.length - 1]!;
     assert.match(tl, /timeline unavailable/);
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+// ─── layer 2 wiring: US-016 live tail (fs.watch + async re-render) ─────────
+
+console.log("\n=== wiring: US-016 live tail ===");
+
+test("wired: live tail — appending events.jsonl surfaces the new row without re-opening the overlay", async () => {
+  const mod = await import("../extensions/harness/index.ts");
+  const cwd = repoWithEvents(FIXTURE_EVENTS);
+  try {
+    // key seq ["t"] lands on the timeline tab and does NOT close → the component
+    // stays alive so we can drive the watcher entry point directly.
+    const { pi, ctx, state, registeredCommands } = mockHarness(cwd, [["t"]]);
+    mod.default(pi as never);
+    await registeredCommands.get("harness")!("", ctx as never);
+
+    const comp = state.lastComponent!;
+    const before = state.renders[0]!.at(-1)!;
+    assert.doesNotMatch(before, /97→98/, "live event not yet present");
+
+    // Simulate the observer appending a flow event while the tab is open.
+    appendFileSync(
+      join(cwd, ".harness-observer", "events.jsonl"),
+      "\n" + jl({ ts: "2026-07-04T10:40:00+00:00", cmd: ["trace"], exit: 0, duration_ms: 12, stdout: "Trace #98 recorded.", stderr: "", db_before: { trace: 97 }, db_after: { trace: 98 } })
+    );
+    // Drive the watcher entry point (the real fs.watch fires the same method).
+    await comp.refreshTimelineTail();
+
+    const after = (comp.render?.(76) ?? []).join("\n");
+    assert.match(after, /trace/, "appended event surfaces in place");
+    assert.match(after, /trace: 97→98/, "db delta of the live event surfaces");
+    assert.equal(state.customCalls, 1, "overlay was NOT re-opened — update was in-place");
+    assert.ok(state.requestRenderCalls >= 1, "the watcher entry requested a re-render (OQ-4 lever)");
+    comp.dispose?.();
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("wired: refreshTimelineTail degrades to a dim message when events.jsonl disappears mid-watch", async () => {
+  const mod = await import("../extensions/harness/index.ts");
+  const cwd = repoWithEvents(FIXTURE_EVENTS);
+  try {
+    const { pi, ctx, state, registeredCommands } = mockHarness(cwd, [["t"]]);
+    mod.default(pi as never);
+    await registeredCommands.get("harness")!("", ctx as never);
+    const comp = state.lastComponent!;
+
+    // File deleted under the watcher (ENOENT mid-watch).
+    rmSync(join(cwd, ".harness-observer", "events.jsonl"));
+    await comp.refreshTimelineTail();
+
+    const after = (comp.render?.(76) ?? []).join("\n");
+    assert.match(after, /timeline unavailable/, "degrades to the dim message, never throws");
+    comp.dispose?.();
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("wired: dispose tears down the watcher and is idempotent (never throws)", async () => {
+  const mod = await import("../extensions/harness/index.ts");
+  const cwd = repoWithEvents(FIXTURE_EVENTS);
+  try {
+    const { pi, ctx, state, registeredCommands } = mockHarness(cwd, [["t"]]);
+    mod.default(pi as never);
+    await registeredCommands.get("harness")!("", ctx as never);
+    const comp = state.lastComponent!;
+
+    assert.doesNotThrow(() => comp.dispose?.(), "first dispose closes the watcher + clears the debounce");
+    assert.doesNotThrow(() => comp.dispose?.(), "second dispose is a no-op");
   } finally {
     rmSync(cwd, { recursive: true, force: true });
   }
