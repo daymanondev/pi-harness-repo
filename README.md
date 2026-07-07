@@ -1,6 +1,6 @@
 # pi-harness
 
-[![Status: P1–P3 done](https://img.shields.io/badge/phase-P1%E2%80%93P3%20done-2ea44f)](#delivery-phases)
+[![Status: P1–P6 done](https://img.shields.io/badge/phase-P1%E2%80%93P6%20done-2ea44f)](#delivery-phases)
 [![pi-package](https://img.shields.io/badge/pi-package-blue)](https://pi.dev)
 
 A [pi](https://pi.dev) extension that makes
@@ -9,10 +9,13 @@ first-class citizen inside the pi coding agent: detect it, surface its durable
 state in the footer, and (in later phases) drive install, dashboard, and the
 `harness-observer` flow timeline behind **one** state-aware `/harness` command.
 
-> **Status:** early. Phases 1–3 are implemented — passive detection +
-> footer, enforcement gates (P2), and the `/harness` overlay router + INSTALL
-> view (P3). The dashboard, timeline, and typed tools (P4–P7) are designed but
-> not yet built. See [Delivery phases](#delivery-phases) and
+> **Status:** shipping. Phases 1–4 and 6 are implemented: passive detection
+> and footer, enforcement gates (P2), the `/harness` overlay router + INSTALL
+> view (P3), the DASHBOARD (matrix/stats/backlog/tools/drift/drill-down, P4),
+> and the next-action footer + `before_agent_start` injection (P6). P5's
+> TIMELINE tab shipped (live tail retired; observer onboarding still planned).
+> The typed tools (P7) are designed but not yet built. See
+> [Delivery phases](#delivery-phases) and
 > [`pi-harness-design/DESIGN.md`](./pi-harness-design/DESIGN.md).
 
 ---
@@ -73,9 +76,9 @@ your bar:
 | **P1** | `detect.ts` + `session_start` footer/widget | ✅ done |
 | **P2** | Flow enforcement gates (intake/trace via `tool_call`) | ✅ done |
 | **P3** | `/harness` overlay router + INSTALL view | ✅ done |
-| **P4** | DASHBOARD view (matrix · stats · backlog · tools) | 🅿️ planned |
-| **P5** | TIMELINE tab + `harness-observer` live tail | 🅿️ planned |
-| **P6** | `before_agent_start` live-state injection | 🅿️ planned |
+| **P4** | DASHBOARD view (matrix · stats · backlog · tools · drift · drill-down) | ✅ done |
+| **P5** | TIMELINE tab + `harness-observer` onboarding (live tail retired; `o`-key onboarding planned) | 🅿️ partial |
+| **P6** | next-action footer + hint widget + `before_agent_start` injection | ✅ done |
 | **P7** | typed tools (`harness_intake` / `harness_query` / `harness_trace`) | 🅿️ planned |
 
 Full design, detection model, and open questions live in
