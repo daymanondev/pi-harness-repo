@@ -109,3 +109,10 @@ Introduces `readiness(state, session)` as the single source of truth for
 - Note: the `init`/`migrate`-doesn't-clear-`intakeRecorded` regression is
   pre-existing session.ts behavior, unchanged by US-018 (p2 session tests
   cover seedSession/grace).
+- **Post-ship defect (same-day):** the `db` footer line originally read "run
+  harness-cli init + migrate" — wrong audience/surface. The footer is
+  user-facing and `/harness` ALREADY routes db-missing to the install wizard
+  (`routeView`: `!dbInitialized → install`; `DEFAULT_FLAGS.initDb=true` runs
+  `init`+`migrate`). Fixed to "db not initialized — run /harness to set up",
+  parallel to the `cli` line. (The Gate A′ *block reason* still names
+  `harness-cli init` directly — that is agent-facing, a different audience.)

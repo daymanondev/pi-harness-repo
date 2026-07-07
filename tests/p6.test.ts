@@ -60,7 +60,7 @@ test("cli ok, db missing → firstUnmet 'db'", () => {
     0
   );
   assert.equal(r.firstUnmet, "db");
-  assert.match(r.nextAction!, /init \+ migrate/);
+  assert.match(r.nextAction!, /\/harness to set up/);
 });
 
 test("setup ok, no intake → firstUnmet 'intake' (drift present is ignored)", () => {
@@ -170,14 +170,14 @@ test("no cli → setup install line", () => {
   assert.equal(out, "🪢 no harness — run /harness to install");
 });
 
-test("db missing → setup init+migrate line", () => {
+test("db missing → points to /harness (the install wizard inits the db)", () => {
   const out = renderFooter(
     hstate({ dbInitialized: false }),
     [],
     { intakeRecorded: true, traceRecorded: true },
     id
   );
-  assert.equal(out, "🪢 db missing — run harness-cli init + migrate");
+  assert.equal(out, "🪢 db not initialized — run /harness to set up");
 });
 
 test("no intake → intake line (drift ignored — lower priority)", () => {

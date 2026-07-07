@@ -267,7 +267,7 @@ function nextActionFor(step: ReadinessStep, driftCount: number): string {
     case "cli":
       return "no harness — run /harness to install";
     case "db":
-      return "db missing — run harness-cli init + migrate";
+      return "db not initialized — run /harness to set up";
     case "intake":
       return "record an intake before editing";
     case "drift":
