@@ -218,3 +218,84 @@ export function decideGateA(
   // (6) everything else (read/grep/glob/ls/...) passes
   return { block: false };
 }
+
+// ─── readiness (P6: next-required-action) ──────────────────────────────────
+//
+// The gate decisions above answer "block this tool_call?". `readiness()`
+// answers the parallel user-facing question: "what is the ONE thing blocking
+// me right now?" It is the single source of truth that the footer (US-018),
+// hint widget (US-019), install-notify (US-020), and injection (US-021)
+// consume. Pure contract — NO pi types, NO filesystem (mirrors the gates).
+//
+// Priority (OQ-1, resolved in US-018): setup (cli→db) > intake > drift > trace.
+// When everything is met, `ready` is true and `nextAction` is null (OQ-3: the
+// footer renders "ready", quiet — no vanity counts).
+
+/** Per-session fields `readiness()` reads. (Broader view of IntakeGateSession.) */
+export interface ReadinessSession {
+  intakeRecorded: boolean;
+  traceRecorded: boolean;
+}
+
+/** Ordered readiness checklist. Each `true` = that precondition is met. */
+export interface ReadinessChecklist {
+  cli: boolean;
+  db: boolean;
+  intake: boolean;
+  /** `true` when there is NO markdown↔durable drift. */
+  drift: boolean;
+  trace: boolean;
+}
+
+export type ReadinessStep = keyof ReadinessChecklist;
+
+export interface ReadinessResult {
+  checklist: ReadinessChecklist;
+  /** First unmet step in priority order, or null when ready. */
+  firstUnmet: ReadinessStep | null;
+  /** Short footer line for the first unmet step, or null when ready. */
+  nextAction: string | null;
+  ready: boolean;
+}
+
+/** Ordered priority (OQ-1): setup → intake → drift → trace. */
+const READINESS_ORDER: ReadinessStep[] = ["cli", "db", "intake", "drift", "trace"];
+
+/** Short, footer-appropriate action text for each unmet step. */
+function nextActionFor(step: ReadinessStep, driftCount: number): string {
+  switch (step) {
+    case "cli":
+      return "no harness — run /harness to install";
+    case "db":
+      return "db missing — run harness-cli init + migrate";
+    case "intake":
+      return "record an intake before editing";
+    case "drift":
+      return `${driftCount} drift — sync markdown↔durable`;
+    case "trace":
+      return "record a trace when done";
+  }
+}
+
+/**
+ * Compute the next-required-action from repo + session + drift state.
+ * Pure: no pi types, no fs. The footer/widget/notify/injection all derive
+ * their text from this. `driftCount` is `drift.length` from detectDrift().
+ */
+export function readiness(
+  state: GateState,
+  session: ReadinessSession,
+  driftCount: number
+): ReadinessResult {
+  const checklist: ReadinessChecklist = {
+    cli: state.cliInstalled,
+    db: state.dbInitialized,
+    intake: session.intakeRecorded,
+    drift: driftCount === 0,
+    trace: session.traceRecorded,
+  };
+  const firstUnmet = READINESS_ORDER.find((s) => !checklist[s]) ?? null;
+  const nextAction =
+    firstUnmet === null ? null : nextActionFor(firstUnmet, driftCount);
+  return { checklist, firstUnmet, nextAction, ready: firstUnmet === null };
+}

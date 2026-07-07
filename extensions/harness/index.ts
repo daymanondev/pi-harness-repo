@@ -35,7 +35,7 @@ import {
   type ExecFn,
   type HarnessState,
 } from "./detect.js";
-import { decideGateA, isHarnessIntakeCall, isHarnessTraceCall } from "./gates.js";
+import { decideGateA, isHarnessIntakeCall, isHarnessTraceCall, readiness } from "./gates.js";
 import { detectDrift, summarizeDrift, type DriftRecord } from "./drift.js";
 import {
   getSession,
@@ -134,31 +134,24 @@ function countIntakeRows(stdout: string): number {
 
 // ─── footer + widgets ──────────────────────────────────────────────────────
 
-/** Render the footer string. Composes stats with drift + no-trace badges. */
-function renderFooter(
+/** Render the footer string. P6 (US-018): shows the ONE next-required-action
+ *  (or `ready`) sourced from pure `readiness()` — no vanity counts (those live
+ *  in the dashboard Stats tab). Exported for unit tests. */
+export function renderFooter(
   state: HarnessState,
   drift: DriftRecord[],
-  traceRecorded: boolean,
+  session: { intakeRecorded: boolean; traceRecorded: boolean },
   fg: (c: string, t: string) => string
 ): string {
-  if (!state.cliInstalled) return fg("warning", "🪢 no harness");
-  if (!state.dbInitialized) return fg("warning", "🪢 cli present, db missing");
+  // detection failure → can't trust cli/db status; show a neutral dash.
   if (state.error) return fg("dim", "🪢 —");
-
-  const s = state.stats;
-  const base = s
-    ? fg("accent", "🪢 ") +
-      fg("dim", `${s.stories} stories · ${s.traces} traces · ${s.backlog_items} backlog`)
-    : fg("dim", "🪢");
-
-  const badges: string[] = [];
-  if (drift.length > 0) {
-    badges.push(fg("warning", ` !${drift.length} drifted`));
-  }
-  if (!traceRecorded) {
-    badges.push(fg("warning", " !no-trace"));
-  }
-  return base + badges.join("");
+  const r = readiness(
+    { cliInstalled: state.cliInstalled, dbInitialized: state.dbInitialized },
+    { intakeRecorded: session.intakeRecorded, traceRecorded: session.traceRecorded },
+    drift.length
+  );
+  if (r.ready) return fg("accent", "🪢 ready");
+  return fg("accent", "🪢 ") + fg("warning", r.nextAction!);
 }
 
 /** Install-hint widget lines, or undefined when fully set up. */
@@ -743,7 +736,7 @@ async function handleHarnessCommand(
         const session = getSession(ctx.cwd);
         ctx.ui.setStatus(
           STATUS_KEY,
-          renderFooter(fresh, driftCache.get(ctx.cwd) ?? [], session.traceRecorded, fg)
+          renderFooter(fresh, driftCache.get(ctx.cwd) ?? [], session, fg)
         );
       } catch {
         // footer refresh is best-effort
@@ -818,7 +811,7 @@ export default function (pi: ExtensionAPI) {
       const { theme } = ctx.ui;
       const fg = (c: string, t: string) => theme.fg(c as never, t);
       const session = getSession(ctx.cwd);
-      ctx.ui.setStatus(STATUS_KEY, renderFooter(state, drift, session.traceRecorded, fg));
+      ctx.ui.setStatus(STATUS_KEY, renderFooter(state, drift, session, fg));
 
       const hint = hintLines(state);
       ctx.ui.setWidget(WIDGET_KEY, hint, { placement: "belowEditor" });
@@ -901,7 +894,7 @@ export default function (pi: ExtensionAPI) {
         const fg = (c: string, t: string) => theme.fg(c as never, t);
         ctx.ui.setStatus(
           STATUS_KEY,
-          renderFooter(state, driftCache.get(ctx.cwd) ?? [], session.traceRecorded, fg)
+          renderFooter(state, driftCache.get(ctx.cwd) ?? [], session, fg)
         );
       } catch {
         // footer refresh is best-effort
@@ -948,7 +941,7 @@ export default function (pi: ExtensionAPI) {
     if (ctx.hasUI) {
       const { theme } = ctx.ui;
       const fg = (c: string, t: string) => theme.fg(c as never, t);
-      ctx.ui.setStatus(STATUS_KEY, renderFooter(state, drift, session.traceRecorded, fg));
+      ctx.ui.setStatus(STATUS_KEY, renderFooter(state, drift, session, fg));
     }
 
     const msg = injectionMessage(state, session.traceRecorded, drift);
