@@ -31,7 +31,6 @@ import {
   renderDashboardLines,
   nextActionFor,
   filterMatrixRows,
-  MATRIX_FILTER_CYCLE,
   needsReverify,
   formatAdrAge,
   ZERO_STATS,
@@ -39,9 +38,8 @@ import {
   type DashboardNav,
   type DashboardTab,
   type DrillTarget,
-  type MatrixFilter,
 } from "../extensions/harness/dashboard.ts";
-import { ansiVisibleWidth } from "../extensions/harness/overlay.ts";
+import { ansiVisibleWidth, normalizeKey } from "../extensions/harness/overlay.ts";
 import type { HarnessState } from "../extensions/harness/detect.ts";
 import { computeDrift, fixHintFor, type DriftKind } from "../extensions/harness/drift.ts";
 
@@ -487,6 +485,57 @@ test("reducer: drilled state ignores cursor keys + Enter (Esc is the only exit)"
 });
 
 console.log("=== dashboard: detail panes (drill-down) ===");
+console.log("=== dashboard: normalizeKey (Kitty CSI-u → legacy, US-031) ===");
+test("normalizeKey: Kitty CSI-u printables decode to the literal char", () => {
+  assert.equal(normalizeKey("\x1b[106u"), "j"); // j
+  assert.equal(normalizeKey("\x1b[107u"), "k"); // k
+  assert.equal(normalizeKey("\x1b[114u"), "r"); // r (refresh)
+  assert.equal(normalizeKey("\x1b[102u"), "f"); // f (filter)
+  assert.equal(normalizeKey("\x1b[116u"), "t"); // t (timeline)
+  assert.equal(normalizeKey("\x1b[49u"), "1");  // 1 (tab)
+  assert.equal(normalizeKey("\x1b[54u"), "6");  // 6 (decisions)
+  assert.equal(normalizeKey("\x1b[105u"), "i");  // i (install confirm)
+});
+test("normalizeKey: Kitty CSI-u Esc/Enter/Up/Down → legacy bytes", () => {
+  assert.equal(normalizeKey("\x1b[27u"), "\u001b");     // Esc
+  assert.equal(normalizeKey("\x1b[27;1u"), "\u001b");   // Esc (explicit mod=1)
+  assert.equal(normalizeKey("\x1b[13u"), "\r");         // Enter
+  assert.equal(normalizeKey("\x1b[13;1u"), "\r");       // Enter (mod=1)
+  assert.equal(normalizeKey("\x1b[57419u"), "\x1b[A");   // Up (Kitty functional)
+  assert.equal(normalizeKey("\x1b[57419;1u"), "\x1b[A"); // Up (mod=1)
+  assert.equal(normalizeKey("\x1b[57420u"), "\x1b[B");   // Down
+});
+test("normalizeKey: legacy bytes pass through unchanged (non-Kitty parity)", () => {
+  // Every input the reducers already match must map to itself so behavior on
+  // non-Kitty terminals is byte-identical.
+  for (const k of ["j", "k", "r", "f", "t", "1", "6", "i", "m", "c", "d", "\u001b", "\r", "\n", "\x1b[A", "\x1b[B", "\x1bOA", "\x1bOB"]) {
+    assert.equal(normalizeKey(k), k, `legacy passthrough failed for ${JSON.stringify(k)}`);
+  }
+});
+test("normalizeKey: modified Kitty keys pass through (no false match)", () => {
+  // Shift/Alt/Ctrl have mod ≥ 2; the reducers never matched them and still
+  // must not (e.g. Ctrl+J ≠ j). Format: \x1b[<cp>;<mod>u, mod=2 → shift.
+  assert.equal(normalizeKey("\x1b[106;2u"), "\x1b[106;2u"); // Shift+j → passthrough
+  assert.equal(normalizeKey("\x1b[106;5u"), "\x1b[106;5u"); // Ctrl+j → passthrough
+});
+test("normalizeKey: CSI-u with event-type suffix (Kitty flag 2) still decodes", () => {
+  // flag 2 (report event types) appends :<event> (1=press). Presses decode.
+  assert.equal(normalizeKey("\x1b[106;1:1u"), "j");       // j press
+  assert.equal(normalizeKey("\x1b[27;1:1u"), "\u001b");    // Esc press
+});
+test("integration: reducer + normalizeKey recognizes Kitty input like legacy", () => {
+  // The bug: on Ghostty/Kitty, handleInput receives \x1b[106u not "j".
+  // After normalizeKey, the reducer must behave exactly as it did for "j".
+  const start: DashboardNav = { tab: "matrix", cursor: 0, drill: null };
+  assert.equal(reduceDashboardNav(start, normalizeKey("\x1b[106u"), LENS(3, 0, 0)).nav.cursor, 1); // j → down
+  assert.equal(reduceDashboardNav({ ...start, cursor: 2 }, normalizeKey("\x1b[107u"), LENS(3, 0, 0)).nav.cursor, 1); // k → up
+  assert.deepEqual(reduceDashboardNav(start, normalizeKey("\x1b[13u"), LENS(3, 0, 0)).nav.drill, { kind: "matrix", index: 0 }); // Enter → drill
+  assert.equal(reduceDashboardNav(start, normalizeKey("\x1b[27u"), LENS(3, 0, 0)).action, "close"); // Esc → close
+  assert.equal(reduceDashboardNav(start, normalizeKey("\x1b[57419u"), LENS(3, 0, 0)).nav.cursor, 0); // Up at 0 → clamp 0
+  assert.equal(reduceDashboardNav({ ...start, cursor: 2 }, normalizeKey("\x1b[57420u"), LENS(3, 0, 0)).nav.cursor, 2); // Down at len-1 → clamp
+  assert.equal(reduceDashboardNav(start, normalizeKey("\x1b[51u"), LENS(0, 0, 0)).nav.tab, "backlog"); // "3" → backlog tab
+});
+
 const PACKET = (id: string, status: string, lane: string, ac: string, ev: string) => ({
   filename: `${id}-foo.md`,
   text: `# ${id} Title\n\n## Status\n\n${status}\n\n## Lane\n\n${lane}\n\n## Acceptance Criteria\n\n${ac}\n\n## Evidence\n\n${ev}\n`,

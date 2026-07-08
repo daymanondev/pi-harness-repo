@@ -4,15 +4,50 @@ Date: 2026-07-07
 
 ## Status
 
-**Superseded by retirement (2026-07-07).** US-016's live tail was **dropped**
-(intake #28, story US-016 → retired, backlog #7 → rejected) — see §Retirement.
-The original OQ-4 conclusion — `TUI.requestRender()` is the external re-render
-lever, not `invalidate()` — stands as a source-level finding, and the freeze
-investigation produced one durable correction: **the freeze is NOT the watch
-primitive.** A PTY-allocated probe proved `fs.watch` and `fs.watchFile` both
-stay healthy against pi's exact raw-stdin attachment, falsifying the Node #20148
-hypothesis below; the cause is pi-internal (the render loop). The historical
-§Revision / §Freeze text is retained for the record.
+**Superseded by retirement (2026-07-07) → root cause FOUND and FIXED (2026-07-08, US-031).**
+US-016's live tail was **dropped** (intake #28, story US-016 → retired, backlog
+# 7 → rejected) — see §Retirement. The original OQ-4 conclusion —
+`TUI.requestRender()` is the external re-render lever, not `invalidate()` —
+stands as a source-level finding, and the freeze investigation produced one
+durable correction: **the freeze is NOT the watch primitive.** A PTY-allocated
+probe proved `fs.watch` and `fs.watchFile` both stay healthy against pi's exact
+raw-stdin attachment, falsifying the Node #20148 hypothesis below; the cause is
+pi-internal (the render loop). The historical §Revision / §Freeze text is
+retained for the record.
+
+## Correction (2026-07-08, US-031) — the REAL root cause
+
+The "pi-internal render loop" conclusion above was **wrong**. The dashboard
+freeze ("opens but no keyboard input registers") was **misdiagnosed** — the
+watcher was a red herring, and v3's "confirmed responsive" was only tested on
+a non-Kitty terminal.
+
+**Actual root cause:** `HarnessOverlayComponent.handleInput` matched keys with
+raw byte compares (`data === "j"`, `isEscape(data) === "\u001b"`,
+`isArrowDown === "\x1b[B"`, `isEnter === "\r"`). pi-tui enables the **Kitty
+keyboard protocol** (flags 1+2+4, `DESIRED_KITTY_KEYBOARD_PROTOCOL_FLAGS = 7`)
+on supporting terminals — **Ghostty, Kitty, WezTerm** — so every key arrives
+as a CSI-u sequence (`\x1b[106u` for `j`, `\x1b[27u` for Esc, `\x1b[13u` for
+Enter, `\x1b[57419u` for Up). None of the raw compares match → the dashboard
+renders but is input-starved. Built-in pi components (SelectList, model
+selector) are unaffected because they use `kb.matches(data, keyId)` →
+`matchesKey()` from `@earendil-works/pi-tui/keys.ts`, which normalizes both
+legacy bytes and Kitty CSI-u.
+
+**Why the misdiagnosis held for a day:** v3 was confirmed responsive via a
+diag log on a terminal where Kitty was not active (single-byte keys matched).
+The recurrence on Ghostty (this repo's operator terminal, `TERM_PROGRAM=ghostty`)
+exposed it. Headless tests could not catch it (they feed single-byte strings,
+not CSI-u) — exactly the limitation flagged below.
+
+**Fix (US-031):** a self-contained `normalizeKey(data)` in `overlay.ts`
+decodes unmodified Kitty CSI-u sequences to the legacy bytes the pure reducer
+already understands (`\x1b[27u`→`\u001b`, `\x1b[13u`→`\r`, `\x1b[57419u`→`\x1b[A`,
+printables → `String.fromCodePoint(cp)`), applied once at the top of
+`handleInput`. Legacy/modified/unknown input passes through unchanged, so
+non-Kitty behavior is byte-identical and all existing tests stay green. The
+watcher retirement (US-016) stands — the live tail is still dropped — but the
+freeze attribution is corrected here.
 
 ## Retirement (2026-07-07)
 

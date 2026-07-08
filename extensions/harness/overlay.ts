@@ -242,8 +242,58 @@ export function padRight(s: string, len: number): string {
   return vis >= len ? trunc : trunc + " ".repeat(len - vis);
 }
 
-/** Esc (bare). Kitty/CSI sequences are multi-byte and start with ESC too, but
- *  the wizard uses no arrow keys, so a bare ESC is unambiguous as "cancel". */
+/**
+ * Normalize a raw key input into the canonical single-byte form the INSTALL
+ * and DASHBOARD reducers expect (`"j"`, `"\u001b"`, `"\r"`, `"\x1b[A"`, …).
+ *
+ * Why this exists: pi-tui enables the Kitty keyboard protocol (flags 1+2+4)
+ * on supporting terminals (Ghostty, Kitty, WezTerm). Under Kitty, keys arrive
+ * as CSI-u sequences — `\x1b[106u` for `j`, `\x1b[27u` for Esc, `\x1b[13u`
+ * for Enter, `\x1b[57419u` for Up — which the reducers' raw byte compares
+ * (`data === "j"`, `isEscape`, `isArrowDown`, …) never match. The dashboard
+ * then renders but no key registers: input-starved. (US-031; corrects the
+ * 0013 misdiagnosis that blamed the live-tail watcher — the real cause is
+ * Kitty-incompatible key matching, not a pi-internal render loop.)
+ *
+ * This is a focused, self-contained decoder (no @earendil-works/pi-tui import
+ * — that package is a nested dep, not resolvable from this extension). It maps
+ * the unmodified Kitty sequences the reducers care about to their legacy
+ * equivalents and passes everything else (legacy bytes, modified keys,
+ * unknown sequences) through unchanged, so behavior on non-Kitty terminals is
+ * byte-identical and all existing unit tests stay green.
+ *
+ * Kitty CSI-u grammar: `\x1b[<cp>(:<shifted>)?(<:base>)?(;<mod>)?(<:event>)?u`.
+ * Modifier field uses Kitty's `1 + bitmask` encoding: 1 (or absent) =
+ * unmodified; ≥2 = Shift/Alt/Ctrl/Super. Key-release events (event=3) are
+ * filtered by pi-tui before they reach the component, so they are not handled
+ * here.
+ */
+export function normalizeKey(data: string): string {
+  // Only CSI-u sequences start with ESC [ … u. Legacy bytes (j, \r, \x1b[A…)
+  // and SS3 (\x1bOA…) do not end in `u`, so they pass through untouched.
+  const m = data.match(/^\x1b\[(\d+)(?::\d*)?(?::\d+)?(?:;(\d+))?(?::\d+)?u$/);
+  if (!m) return data;
+  const cp = parseInt(m[1]!, 10);
+  const mod = m[2] !== undefined ? parseInt(m[2]!, 10) : 1;
+  // Only remap unmodified key presses; modified keys (Shift/Alt/Ctrl/…)
+  // fall through so the reducer treats them as the no-op it always did.
+  if (mod !== 1) return data;
+  switch (cp) {
+    case 27: return "\u001b";      // Esc
+    case 13: return "\r";          // Enter
+    case 57419: return "\x1b[A";   // Up (Kitty functional codepoint)
+    case 57420: return "\x1b[B";   // Down
+    default:
+      // Printable codepoint → the literal char (so `key === "j"`, `key === "1"`,
+      // `TAB_KEYS[key]`, … match). Control codepoints < 32 are not used by the
+      // reducers; pass the raw sequence through (no-op, same as legacy).
+      return cp >= 32 ? String.fromCodePoint(cp) : data;
+  }
+}
+
+/** Esc (bare). Expects a normalized key (see `normalizeKey`); also matches a
+ *  raw bare ESC on non-Kitty terminals. Kitty CSI-u `\x1b[27u` is normalized
+ *  to `\u001b` upstream so this stays a single-byte compare. */
 export function isEscape(data: string): boolean {
   return data === "\u001b";
 }

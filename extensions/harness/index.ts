@@ -49,6 +49,7 @@ import {
   isEnter,
   isEscape,
   nextMode,
+  normalizeKey,
   renderInstallLines,
   routeView,
   type FgFn,
@@ -339,19 +340,25 @@ class HarnessOverlayComponent {
   }
 
   handleInput(data: string): void {
+    // US-031: normalize Kitty keyboard-protocol (CSI-u) sequences to the
+    // single-byte form the reducers compare against. Without this, on
+    // Kitty-capable terminals (Ghostty/Kitty/WezTerm) where pi-tui enables
+    // Kitty flags=7, every key arrives as `\x1b[<cp>u` and no raw compare
+    // matches — the overlay renders but is input-starved.
+    const key = normalizeKey(data);
     if (this.view === "install") {
-      if (isEscape(data)) {
+      if (isEscape(key)) {
         this.onDone({ action: "cancel" });
         return;
       }
-      if (isEnter(data) || data === "i") {
+      if (isEnter(key) || key === "i") {
         this.onDone({ action: "install", flags: this.flags });
         return;
       }
-      if (data === "m") this.flags = { ...this.flags, mode: nextMode(this.flags, this.state) };
-      else if (data === "c") this.flags = { ...this.flags, claude: !this.flags.claude };
-      else if (data === "r") this.flags = { ...this.flags, dryRun: !this.flags.dryRun };
-      else if (data === "d") this.flags = { ...this.flags, initDb: !this.flags.initDb };
+      if (key === "m") this.flags = { ...this.flags, mode: nextMode(this.flags, this.state) };
+      else if (key === "c") this.flags = { ...this.flags, claude: !this.flags.claude };
+      else if (key === "r") this.flags = { ...this.flags, dryRun: !this.flags.dryRun };
+      else if (key === "d") this.flags = { ...this.flags, initDb: !this.flags.initDb };
       return;
     }
     // DASHBOARD — delegate the full key model to the pure reducer (US-014)
@@ -365,7 +372,7 @@ class HarnessOverlayComponent {
       timeline: this.data.timeline.length,
       decisions: this.data.decisions.length,
     };
-    const res = reduceDashboardNav(this.nav, data, lens);
+    const res = reduceDashboardNav(this.nav, key, lens);
     this.nav = res.nav;
     if (res.action === "close") this.onDone({ action: "close" });
     else if (res.action === "refresh") this.onDone({ action: "refresh" });
