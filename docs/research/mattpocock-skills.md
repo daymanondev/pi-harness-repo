@@ -2,7 +2,7 @@
 
 - **Intake:** #49 (`harness_improvement`, tiny)
 - **Date:** 2026-07-08
-- **Context:** auxiliary research for initiative #44 (realign griller/kicker/dashboard to upstream repository-harness theory). Source: https://github.com/mattpocock/skills
+- **Context:** auxiliary research for initiative #44 (realign griller/kicker/dashboard to upstream repository-harness theory). Source: <https://github.com/mattpocock/skills>
 
 ## Summary
 
