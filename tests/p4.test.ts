@@ -30,6 +30,7 @@ import {
   reduceDashboardNav,
   renderDashboardLines,
   nextActionFor,
+  dispatchPromptFor,
   filterMatrixRows,
   needsReverify,
   formatAdrAge,
@@ -257,6 +258,45 @@ test("nextActionFor: ungrilled story → grill + skill+id prompt", () => {
   assert.match(a.prompt, /US-024/);
 });
 
+// ─── dispatch prompt (US-027) ─────────────────────────────────────────────
+
+console.log("=== dashboard: dispatchPromptFor (US-027) ===");
+test("dispatchPromptFor: backlog → triage prompt with #id + close/promote/reframe", () => {
+  const p = dispatchPromptFor({ kind: "backlog", id: "5", title: "Dashboard view-only" }, new Set());
+  assert.match(p, /start with backlog #5/);
+  assert.match(p, /triage/);
+  assert.match(p, /close/);
+  assert.match(p, /promote/);
+  assert.match(p, /reframe/);
+});
+test("dispatchPromptFor: matrix ungrilled → grill prompt", () => {
+  const p = dispatchPromptFor({ kind: "matrix", id: "US-027", title: "backlog triage" }, new Set());
+  assert.match(p, /grill US-027/);
+  assert.match(p, /harness-intake-griller/);
+});
+test("dispatchPromptFor: matrix grilled → implement prompt with packet path", () => {
+  const p = dispatchPromptFor({ kind: "matrix", id: "US-023", title: "grilled-badge" }, new Set(["US-023"]));
+  assert.match(p, /implement US-023/);
+  assert.match(p, /docs\/stories\/US-023-\*\.md/);
+});
+test("dispatchPromptFor: every prompt leads with the AGENTS.md idiom", () => {
+  const grill = dispatchPromptFor({ kind: "matrix", id: "US-001", title: "x" }, new Set());
+  const impl = dispatchPromptFor({ kind: "matrix", id: "US-001", title: "x" }, new Set(["US-001"]));
+  const bl = dispatchPromptFor({ kind: "backlog", id: "1", title: "x" }, new Set());
+  for (const p of [grill, impl, bl]) {
+    assert.match(p, /^please check @AGENTS\.md, follow the harness flow and/);
+  }
+});
+test("US-027: backlog detail renders [s] start hint", () => {
+  const text = renderDashboardLines(
+    bareState(),
+    nav("backlog", 0, { kind: "backlog", index: 0 }),
+    dashData({ backlog: [{ id: 5, title: "view-only", status: "proposed", risk: "normal", detail: "" }] }),
+    id
+  ).join("\n");
+  assert.match(text, /\[s\] start.*#5/);
+});
+
 // ─── render: matrix tab ────────────────────────────────────────────────────
 
 console.log("=== dashboard: renderDashboardLines (matrix tab) ===");
@@ -267,7 +307,7 @@ test("renders title, detected-state header, tab strip, footer hints", () => {
   assert.match(text, /db ok/);
   assert.match(text, /1 matrix/);
   assert.match(text, /2 stats.*3 backlog.*4 tools.*5 drift.*t timeline/);
-  assert.match(text, /\[1-6,t\] tabs.*\[r\] refresh.*\[Esc\] close/);
+  assert.match(text, /\[r\] refresh.*\[s\] start.*\[Esc\] close/);
 });
 test("matrix tab lists every story row with status + id", () => {
   const text = renderDashboardLines(bareState(), nav("matrix"), dashData({ matrix: parseMatrixNumeric(FIXTURE_MATRIX) }), id).join("\n");
@@ -657,6 +697,34 @@ test("reducer: tab switch resets matrixFilter to all", () => {
   assert.equal(r.tab, "backlog");
   assert.equal(r.matrixFilter, "all");
 });
+
+// ─── reducer: `s` dispatch signal (US-027) ────────────────────────────────
+test("reducer: `s` on matrix (non-empty) → action dispatch", () => {
+  const st: DashboardNav = { tab: "matrix", cursor: 0, drill: null };
+  assert.equal(reduceDashboardNav(st, "s", LENS(3, 0, 0)).action, "dispatch");
+});
+test("reducer: `s` on backlog (non-empty) → action dispatch", () => {
+  const st: DashboardNav = { tab: "backlog", cursor: 0, drill: null };
+  assert.equal(reduceDashboardNav(st, "s", LENS(0, 3, 0)).action, "dispatch");
+});
+test("reducer: `s` on empty list → no-op (no dispatch)", () => {
+  const st: DashboardNav = { tab: "backlog", cursor: 0, drill: null };
+  assert.equal(reduceDashboardNav(st, "s", LENS(0, 0, 0)).action, undefined);
+});
+test("reducer: `s` on non-dispatchable tab (stats) → no-op", () => {
+  const st: DashboardNav = { tab: "stats", cursor: 0, drill: null };
+  assert.equal(reduceDashboardNav(st, "s", LENS(0, 0, 0)).action, undefined);
+});
+test("reducer: `s` works when drilled (cursor holds the row)", () => {
+  const drilled: DashboardNav = { tab: "backlog", cursor: 1, drill: { kind: "backlog", index: 1 } };
+  assert.equal(reduceDashboardNav(drilled, "s", LENS(0, 3, 0)).action, "dispatch");
+});
+test("reducer: `s` preserves nav (no cursor/filter change)", () => {
+  const st: DashboardNav = { tab: "matrix", cursor: 2, drill: null, matrixFilter: "planned" };
+  const r = reduceDashboardNav(st, "s", LENS(3, 0, 0)).nav;
+  assert.equal(r.cursor, 2);
+  assert.equal(r.matrixFilter, "planned");
+});
 test("reducer: `r` refresh preserves the active matrixFilter", () => {
   const st: DashboardNav = { tab: "matrix", cursor: 0, drill: null, matrixFilter: "planned" };
   const res = reduceDashboardNav(st, "r", LENS(3, 0, 0));
@@ -862,7 +930,7 @@ function mockHarness(
   const matrixCode = opts.matrixCode ?? 0;
   const keySeqs = opts.keySeqs ?? [["\u001b"]];
   const execCalls: { cmd: string; args: string[] }[] = [];
-  const state = { customCalls: 0, matrixCalls: 0, renders: [] as string[][] };
+  const state = { customCalls: 0, matrixCalls: 0, renders: [] as string[][], sentMessages: [] as string[] };
   let seqIdx = 0;
   const registeredCommands = new Map<string, (a: string, c: unknown) => Promise<void>>();
 
@@ -872,6 +940,9 @@ function mockHarness(
     },
     on() {
       /* not exercised by the command handler */
+    },
+    sendUserMessage(content: unknown) {
+      state.sentMessages.push(String(content));
     },
     async exec(cmd: string, args: string[]) {
       execCalls.push({ cmd, args });
@@ -1116,6 +1187,50 @@ test("failing backlog query (exit 1) → backlog tab shows a dim error row, neve
     await registeredCommands.get("harness")!("", ctx as never); // must not throw
     const backlogRender = state.renders[0]![1]!;
     assert.match(backlogRender, /backlog unavailable/, "backlog tab degrades to error row");
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+// ─── US-027: dispatch key (in-session sendUserMessage) ────────────────────
+
+console.log("=== dashboard: US-027 dispatch key ===");
+test("US-027 dispatch: `s` on backlog → pi.sendUserMessage with triage prompt", async () => {
+  const mod = await import("../extensions/harness/index.ts");
+  const cwd = installedRepo();
+  try {
+    const { pi, ctx, state, registeredCommands } = mockHarness(cwd, { keySeqs: [["3", "s"]] });
+    mod.default(pi as never);
+    await registeredCommands.get("harness")!("", ctx as never);
+    assert.equal(state.sentMessages.length, 1, "dispatch sends exactly one user message");
+    assert.match(state.sentMessages[0]!, /start with backlog #2/);
+    assert.match(state.sentMessages[0]!, /triage/);
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+test("US-027 dispatch: `s` on matrix → grill prompt (ungrilled default)", async () => {
+  const mod = await import("../extensions/harness/index.ts");
+  const cwd = installedRepo();
+  try {
+    const { pi, ctx, state, registeredCommands } = mockHarness(cwd, { keySeqs: [["s"]] });
+    mod.default(pi as never);
+    await registeredCommands.get("harness")!("", ctx as never);
+    assert.equal(state.sentMessages.length, 1);
+    // WIRED_MATRIX row 0 = US-001; grilledStoryIds empty (intakes unmocked) → grill
+    assert.match(state.sentMessages[0]!, /grill US-001/);
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+test("US-027 dispatch: Esc (no `s`) → no user message sent", async () => {
+  const mod = await import("../extensions/harness/index.ts");
+  const cwd = installedRepo();
+  try {
+    const { pi, ctx, state, registeredCommands } = mockHarness(cwd, { keySeqs: [["\u001b"]] });
+    mod.default(pi as never);
+    await registeredCommands.get("harness")!("", ctx as never);
+    assert.equal(state.sentMessages.length, 0, "plain close sends nothing");
   } finally {
     rmSync(cwd, { recursive: true, force: true });
   }

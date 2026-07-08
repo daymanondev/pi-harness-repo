@@ -71,7 +71,9 @@ import {
   reduceDashboardNav,
   renderDashboardLines,
   filterMatrixRows,
+  dispatchPromptFor,
   type DashboardData,
+  type DispatchTarget,
   type DashboardNav,
   type DashboardTab,
   type MatrixRow,
@@ -297,7 +299,8 @@ type HarnessOverlayResult =
   | { action: "install"; flags: InstallFlags }
   | { action: "refresh" }
   | { action: "cancel" }
-  | { action: "close" };
+  | { action: "close" }
+  | { action: "dispatch"; prompt: string; id: string; tab: DashboardTab };
 
 interface HarnessOverlayOpts {
   view: HarnessView;
@@ -376,6 +379,38 @@ class HarnessOverlayComponent {
     this.nav = res.nav;
     if (res.action === "close") this.onDone({ action: "close" });
     else if (res.action === "refresh") this.onDone({ action: "refresh" });
+    else if (res.action === "dispatch") {
+      const target = this.dispatchTarget();
+      if (target) {
+        this.onDone({
+          action: "dispatch",
+          prompt: dispatchPromptFor(target, this.data.grilledStoryIds),
+          id: target.id,
+          tab: this.nav.tab,
+        });
+      }
+    }
+  }
+
+  /** Resolve the selected row of a dispatchable tab to a DispatchTarget.
+   *  Returns null only if the list is empty (the reducer guards `len > 0`
+   *  before signaling dispatch, so this is defensive). */
+  private dispatchTarget(): DispatchTarget | null {
+    const i = this.nav.cursor;
+    if (this.nav.tab === "backlog") {
+      const row = this.data.backlog[i];
+      return row ? { kind: "backlog", id: String(row.id), title: row.title } : null;
+    }
+    if (this.nav.tab === "matrix") {
+      const filtered = filterMatrixRows(
+        this.data.matrix,
+        this.data.grilledStoryIds,
+        this.nav.matrixFilter
+      );
+      const row = filtered[i];
+      return row ? { kind: "matrix", id: row.id, title: row.title } : null;
+    }
+    return null;
   }
 
   render(width: number): string[] {
@@ -776,6 +811,14 @@ async function handleHarnessCommand(
         { overlay: true, overlayOptions: { width: "76%", margin: 2 } }
       );
     } while (result.action === "refresh");
+    // US-027: hand the selected list item to the agent in-session. Mirrors the
+    // operator's manual "start with backlog #N / grill US-NNN / implement
+    // US-NNN" — the resulting turn is indistinguishable from a typed one.
+    // ADR-0014 permits this in-session sendUserMessage; pane-spawn stays
+    // deferred (US-028).
+    if (result.action === "dispatch") {
+      pi.sendUserMessage(result.prompt);
+    }
     return;
   }
 

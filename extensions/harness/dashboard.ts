@@ -590,6 +590,59 @@ export function nextActionFor(
   };
 }
 
+// ─── dashboard dispatch (US-027) ───────────────────────────────────────────
+
+/**
+ * The list item the operator chose to dispatch to the agent, and the kind of
+ * tab it came from. `id` is the backlog item number (e.g. "5") or the story id
+ * ("US-NNN"); `title` is the row title (display only, not interpolated into
+ * the prompt — the agent re-reads the item by id).
+ */
+export interface DispatchTarget {
+  kind: "backlog" | "matrix";
+  id: string;
+  title: string;
+}
+
+/**
+ * Pure: build the user message that hands a dashboard list item to the agent
+ * in-session (US-027). Mirrors the operator's manual idiom ("please check
+ * @AGENTS.md, follow the harness flow and start with backlog #N") so the
+ * resulting turn is indistinguishable from one the operator typed.
+ *
+ * - Backlog → a triage prompt: the agent reviews + verifies the item, then
+ *   decides close / promote-to-story / reframe WITH the operator. The
+ *   decision is a discussion, not a keystroke — closing still goes through the
+ *   agent (the dashboard never mutates durable state).
+ * - Matrix/story → reuses `nextActionFor`: ungrilled → grill; grilled →
+ *   implement (against the packet).
+ *
+ * The US-023 advisory text in the detail pane is unchanged; this is the
+ * *action* layer on top. See ADR-0014 (in-session sendUserMessage permitted;
+ * pane-spawn still deferred, US-028).
+ */
+export function dispatchPromptFor(
+  target: DispatchTarget,
+  grilledStoryIds: ReadonlySet<string>
+): string {
+  const base = "please check @AGENTS.md, follow the harness flow and";
+  if (target.kind === "backlog") {
+    return (
+      `${base} start with backlog #${target.id}. ` +
+      `Review and verify whether it is still relevant, then triage with me: ` +
+      `close (if done or no longer valid), promote to a story, or reframe.`
+    );
+  }
+  const action = nextActionFor({ id: target.id }, grilledStoryIds);
+  if (action.next === "grill") {
+    return (
+      `${base} grill ${target.id} — run harness-intake-griller to record a ` +
+      `spec_slice intake and fill the story packet.`
+    );
+  }
+  return `${base} implement ${target.id} against docs/stories/${target.id}-*.md (acceptance criteria).`;
+}
+
 // ─── matrix status-filter (US-026) ─────────────────────────────────────────
 
 /** Matrix status-filter stops (US-026). `f` cycles through these in order. */
@@ -640,10 +693,13 @@ export interface DashboardNav {
   matrixFilter?: MatrixFilter;
 }
 
-/** Result of reducing one key: new nav + optional close/refresh action. */
+/** Result of reducing one key: new nav + optional action. `dispatch` (US-027)
+ *  signals that the operator pressed `s` on a dispatchable list row; the
+ *  component builds the prompt from the selected row + calls onDone (the
+ *  reducer has no row data, so it only signals). */
 export interface DashboardNavResult {
   nav: DashboardNav;
-  action?: "close" | "refresh";
+  action?: "close" | "refresh" | "dispatch";
 }
 
 /** Hotkey → tab. Shared by the reducer + the component. */
@@ -719,6 +775,15 @@ export function reduceDashboardNav(
   if (key === "r") return { nav, action: "refresh" };
   const t = TAB_KEYS[key];
   if (t) return { nav: { tab: t, cursor: 0, drill: null, matrixFilter: "all" } };
+  // US-027: `s` dispatches the selected row to the agent in-session
+  // (pi.sendUserMessage). Fires on matrix + backlog — the dispatchable list
+  // tabs — in both list and drilled states (the cursor holds the row either
+  // way). The reducer only signals `dispatch`; the component owns the
+  // selected-row → prompt build (it has the data, the reducer does not).
+  if (key === "s" && (nav.tab === "matrix" || nav.tab === "backlog")) {
+    const len = lens[nav.tab] ?? 0;
+    return len > 0 ? { nav, action: "dispatch" } : { nav };
+  }
   // cursor / drill only apply to list tabs, and only when not already drilled
   if (nav.drill || !isListTab(nav.tab)) return { nav };
   // US-026: `f` cycles the matrix status-filter (matrix-only; no-op on other
@@ -822,12 +887,20 @@ export function renderDashboardLines(
   }
   content.push("");
 
-  // ── footer hints (context-sensitive: drilled vs list) ──
+  // ── footer hints (context-sensitive: drilled vs list; [s] on dispatchable tabs) ──
+  // `[1-6,t] tabs` is omitted — the tab strip above already labels each tab
+  // with its hotkey; repeating it here pushed `[Esc] close` past the 76-col
+  // truncation once `[s] start` was added (US-027).
+  const dispatchable = nav.tab === "matrix" || nav.tab === "backlog";
   content.push(
     dim(
       nav.drill
-        ? "[Esc] back to list"
-        : "[↑↓/j,k] move · [Enter] open · [1-6,t] tabs · [r] refresh · [Esc] close"
+        ? dispatchable
+          ? "[Esc] back · [s] start"
+          : "[Esc] back to list"
+        : "[↑↓/j,k] move · [Enter] open · [r] refresh" +
+          (dispatchable ? " · [s] start" : "") +
+          " · [Esc] close"
     )
   );
   return box("repository-harness · dashboard", content, fg, w);
@@ -1229,6 +1302,7 @@ function renderStoryDetail(
       `${dim("next:")} ${action.next === "implement" ? fg("accent", "implement") : fg("warning", "grill")}`
   );
   out.push(dim("→ " + truncateAnsi(action.prompt, innerW - 2)));
+  out.push(dim(`[s] start — ${action.next === "grill" ? "grill" : "implement"} ${row.id} now`));
   // US-025: Provenance lane — Tier 2 evidence for THIS story (read-only). Shown
   // for every story (independent of packet presence): intake linkage + traces.
   // Decisions omitted — no decision.story_id FK; the DECISIONS tab owns them.
@@ -1278,6 +1352,7 @@ function renderBacklogDetail(row: BacklogRow, fg: FgFn, innerW: number): string[
   } else {
     out.push(dim("Detail: (none recorded)"));
   }
+  out.push(dim(`[s] start — hand #${row.id} to the agent to triage (close / promote / reframe)`));
   return out;
 }
 
