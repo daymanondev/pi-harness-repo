@@ -1,5 +1,7 @@
 # 0012 Kicker grills the requirement before the umbrella intake
 
+> Partially superseded by [ADR-0015](./0015-realign-grill-to-clarification.md) (2026-07-08): the "grill" naming of the requirement-understanding phase. Substance retained — understand-before-intake, the driven per-slice loop, leading word "requirement". The phase is renamed "sharpen" (see GLOSSARY).
+
 Date: 2026-07-06
 
 ## Status

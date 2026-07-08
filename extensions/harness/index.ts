@@ -59,7 +59,8 @@ import {
 } from "./overlay.js";
 import {
   parseMatrixNumeric,
-  parseGrilledStoryIds,
+  parseClassifiedStoryIds,
+  parseInitiatives,
   parseStats,
   parseBacklogOpen,
   parseDecisionMeta,
@@ -81,6 +82,7 @@ import {
   type StatsCounts,
   type AdrRow,
   type StoryProvenance,
+  type InitiativeGroup,
   type BacklogRow,
   type DecisionMeta,
   type ToolRow,
@@ -339,7 +341,7 @@ class HarnessOverlayComponent {
     this.fg = o.fg;
     this.onDone = o.onDone;
     this.nav = { tab: o.tab ?? "matrix", cursor: 0, drill: null, matrixFilter: "all" };
-    this.data = o.data ?? { matrix: [], stats: ZERO_STATS, backlog: [], tools: [], drift: [], timeline: [], decisions: [], packets: {}, grilledStoryIds: new Set(), provenance: new Map(), errors: {} };
+    this.data = o.data ?? { matrix: [], stats: ZERO_STATS, backlog: [], tools: [], drift: [], timeline: [], decisions: [], packets: {}, classifiedStoryIds: new Set(), provenance: new Map(), initiatives: [], errors: {} };
   }
 
   handleInput(data: string): void {
@@ -367,13 +369,14 @@ class HarnessOverlayComponent {
     // DASHBOARD — delegate the full key model to the pure reducer (US-014)
     // US-026: lens.matrix is the FILTERED length so cursor/drill clamp to the
     // visible list, not the full matrix. Computed from the current filter.
-    const filteredMatrix = filterMatrixRows(this.data.matrix, this.data.grilledStoryIds, this.nav.matrixFilter);
+    const filteredMatrix = filterMatrixRows(this.data.matrix, this.data.classifiedStoryIds, this.nav.matrixFilter);
     const lens = {
       matrix: filteredMatrix.length,
       backlog: this.data.backlog.length,
       drift: this.data.drift.length,
       timeline: this.data.timeline.length,
       decisions: this.data.decisions.length,
+      initiatives: this.data.initiatives.reduce((n, g) => n + g.slices.length, 0),
     };
     const res = reduceDashboardNav(this.nav, key, lens);
     this.nav = res.nav;
@@ -384,7 +387,7 @@ class HarnessOverlayComponent {
       if (target) {
         this.onDone({
           action: "dispatch",
-          prompt: dispatchPromptFor(target, this.data.grilledStoryIds),
+          prompt: dispatchPromptFor(target, this.data.classifiedStoryIds),
           id: target.id,
           tab: this.nav.tab,
         });
@@ -404,11 +407,16 @@ class HarnessOverlayComponent {
     if (this.nav.tab === "matrix") {
       const filtered = filterMatrixRows(
         this.data.matrix,
-        this.data.grilledStoryIds,
+        this.data.classifiedStoryIds,
         this.nav.matrixFilter
       );
       const row = filtered[i];
       return row ? { kind: "matrix", id: row.id, title: row.title } : null;
+    }
+    if (this.nav.tab === "initiatives") {
+      const slices = this.data.initiatives.flatMap((g) => g.slices);
+      const slice = slices[i];
+      return slice ? { kind: "matrix", id: slice.id, title: slice.title } : null;
     }
     return null;
   }
@@ -496,12 +504,12 @@ async function fetchMatrix(
   }
 }
 
-/** Fetch the grilled-story-id set for the US-023 control-surface signal
- *  (grilled = a `spec_slice` intake links the story). `query intakes` does NOT
+/** Fetch the classified-story-id set for the US-023/US-036 control-surface
+ *  signal (classified = ANY intake links the story). `query intakes` does NOT
  *  surface the `story_id` column, so the durable layer is queried directly via
- *  SQL for the precise intake-linkage signal. Best-effort: any failure yields
- *  an empty set so badges degrade to ungrilled, never throws out of the overlay. */
-async function fetchGrilledStoryIds(
+ *  SQL. Best-effort: any failure yields an empty set so badges degrade to
+ *  unclassified, never throws out of the overlay. */
+async function fetchClassifiedStoryIds(
   pi: ExtensionAPI,
   ctx: ExtensionCommandContext
 ): Promise<Set<string>> {
@@ -512,13 +520,37 @@ async function fetchGrilledStoryIds(
       [
         "query",
         "sql",
-        "SELECT DISTINCT story_id FROM intake WHERE input_type='spec_slice' AND story_id IS NOT NULL",
+        "SELECT DISTINCT story_id FROM intake WHERE story_id IS NOT NULL",
       ],
       { cwd: ctx.cwd, signal: ctx.signal, timeout: 5_000 }
     );
-    return res.code === 0 ? parseGrilledStoryIds(res.stdout) : new Set();
+    return res.code === 0 ? parseClassifiedStoryIds(res.stdout) : new Set();
   } catch {
     return new Set();
+  }
+}
+
+/** Fetch the initiative → slices groups for the INITIATIVES tab (US-036): the
+ *  `new_initiative` intakes + the stories linked via `parent_intake_id`
+ *  (migration 009). Best-effort: any failure yields an empty list so the tab
+ *  degrades to the empty-state, never throws out of the overlay. Read-only. */
+async function fetchInitiatives(
+  pi: ExtensionAPI,
+  ctx: ExtensionCommandContext
+): Promise<InitiativeGroup[]> {
+  try {
+    const bin = cliBinaryPath(ctx.cwd);
+    const sql = (q: string) =>
+      pi.exec(bin, ["query", "sql", q], { cwd: ctx.cwd, signal: ctx.signal, timeout: 5_000 });
+    const [intakesRes, slicesRes] = await Promise.all([
+      sql("SELECT id||'|'||summary FROM intake WHERE input_type='new_initiative' ORDER BY id DESC"),
+      sql("SELECT parent_intake_id||'|'||id||'|'||title||'|'||COALESCE(status,'') FROM story WHERE parent_intake_id IS NOT NULL ORDER BY parent_intake_id, id"),
+    ]);
+    return intakesRes.code === 0 && slicesRes.code === 0
+      ? parseInitiatives(intakesRes.stdout, slicesRes.stdout)
+      : [];
+  } catch {
+    return [];
   }
 }
 
@@ -727,7 +759,7 @@ async function fetchDashboardData(
   pi: ExtensionAPI,
   ctx: ExtensionCommandContext
 ): Promise<DashboardData> {
-  const [matrix, stats, backlog, tools, drift, packets, timeline, grilledStoryIds, decisions, provenance] = await Promise.all([
+  const [matrix, stats, backlog, tools, drift, packets, timeline, classifiedStoryIds, decisions, provenance, initiatives] = await Promise.all([
     fetchMatrix(pi, ctx),
     fetchStatsCounts(pi, ctx),
     fetchBacklogRows(pi, ctx),
@@ -735,9 +767,10 @@ async function fetchDashboardData(
     fetchDrift(pi, ctx),
     fetchPackets(pi, ctx),
     fetchTimeline(pi, ctx),
-    fetchGrilledStoryIds(pi, ctx),
+    fetchClassifiedStoryIds(pi, ctx),
     fetchDecisions(pi, ctx),
     fetchProvenance(pi, ctx),
+    fetchInitiatives(pi, ctx),
   ]);
   const errors: Partial<Record<DashboardTab, string>> = {};
   if (stats === null) errors.stats = "stats";
@@ -755,8 +788,9 @@ async function fetchDashboardData(
     timeline: timeline ?? [],
     decisions: decisions ?? [],
     packets,
-    grilledStoryIds,
+    classifiedStoryIds,
     provenance,
+    initiatives,
     errors,
   };
 }

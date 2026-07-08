@@ -1,5 +1,7 @@
 # 0010 Workflow model — initiative + vertical slices, DESIGN as roadmap
 
+> Partially superseded by [ADR-0015](./0015-realign-grill-to-clarification.md) (2026-07-08): the per-slice `spec_slice` grill gate and the "grilled" badge. Substance retained — one umbrella `new_initiative` intake, DESIGN-as-roadmap, decompose-before-coding, just-in-time classification, no "intake everything upfront".
+
 Date: 2026-07-06
 
 ## Status

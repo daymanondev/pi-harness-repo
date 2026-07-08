@@ -26,20 +26,31 @@ work before implementation begins.
 
 ## Grill
 
-The act of turning **one slice** into a classified, recorded intake — i.e.
-running `harness-intake-griller`. The durable outcome is a `spec_slice` intake
-linked to the story; that linkage **is** the dashboard "grilled" signal
-(US-023 grilled-badge, detail-pane `next:` router, drift Gate B′). Grill =
-classify + record, at slice granularity. Contrast **Sharpen**.
+An **on-demand clarification interview** for a single story or slice that is
+ambiguous — i.e. running `harness-intake-griller`. The grill explores the repo,
+asks one question at a time, recommends-then-confirms, and **sharpens
+understanding** so the automatic intake classification can proceed. It is NOT a
+mandatory per-slice intake gate and does not gate implementation (ADR-0015).
+Grill = clarify, at story granularity. Contrast **Sharpen** (requirement-level)
+and **Classified** (the readiness signal).
 
 ## Sharpen
 
-The act of **understanding a requirement** before any slice is recorded —
-i.e. the grill phase of `harness-project-kicker` (ADR-0012), at requirement
-granularity. Sharpening produces understanding (shape, tracer-bullet, scope,
-risk surface), **not** durable rows; each slice is then *grilled* just-in-time
-by the griller. The two terms exist to keep slice-level classify-and-record
-(grill) distinct from requirement-level understand (sharpen).
+The act of **understanding a requirement** before the umbrella intake is
+recorded — i.e. the `sharpen` phase of `harness-project-kicker` (ADR-0012,
+renamed from "grill" by ADR-0015), at requirement granularity. Sharpening
+produces understanding (shape, tracer-bullet, scope, risk surface) and one
+`new_initiative` intake + initiative notes — NOT per-slice durable rows; each
+slice is then **classified** (automatic intake) just-in-time when worked.
+
+## Classified
+
+The dashboard readiness signal for a story: a story is **classified** when
+**any** intake links it (not only `spec_slice`). Classified → ready to
+implement; unclassified → classify (record an intake; use the grill only if the
+story is unclear). Replaces the former "grilled" badge (US-023, reworked by
+US-036 / ADR-0015). Classification is the latest linked intake; changes append a
+new `change_request` intake rather than amending.
 
 ## Component Taxonomy
 

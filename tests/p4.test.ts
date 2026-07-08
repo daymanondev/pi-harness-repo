@@ -18,7 +18,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   parseMatrixNumeric,
-  parseGrilledStoryIds,
+  parseClassifiedStoryIds,
+  parseInitiatives,
   parseStats,
   parseBacklogOpen,
   parseDecisionMeta,
@@ -82,7 +83,7 @@ const id = (_c: string, t: string) => t; // identity fg for plain-text assertion
 
 /** Build a DashboardData with empty defaults, overridden by `over`. */
 function dashData(over: Partial<DashboardData> = {}): DashboardData {
-  return { matrix: [], stats: ZERO_STATS, backlog: [], tools: [], drift: [], timeline: [], decisions: [], packets: {}, grilledStoryIds: new Set(), provenance: new Map(), errors: {}, ...over };
+  return { matrix: [], stats: ZERO_STATS, backlog: [], tools: [], drift: [], timeline: [], decisions: [], packets: {}, classifiedStoryIds: new Set(), provenance: new Map(), initiatives: [], errors: {}, ...over };
 }
 
 /** Build a DashboardNav for render assertions (cursor + drill default off). */
@@ -235,25 +236,25 @@ test("malformed JSON → null; non-array → null (never throws)", () => {
 // ─── control-surface routing (US-023) ─────────────────────────────────────
 
 console.log("=== dashboard: nextActionFor + grilled signal (US-023) ===");
-test("parseGrilledStoryIds: extracts US-NNN tokens, ignores header/separator", () => {
+test("parseClassifiedStoryIds: extracts US-NNN tokens, ignores header/separator", () => {
   const sql = "story_id\n--------\nUS-006  \nUS-023  \n";
-  assert.deepEqual(parseGrilledStoryIds(sql), new Set(["US-006", "US-023"]));
+  assert.deepEqual(parseClassifiedStoryIds(sql), new Set(["US-006", "US-023"]));
 });
-test("parseGrilledStoryIds: empty/noise/garbage → empty set (never throws)", () => {
-  assert.deepEqual(parseGrilledStoryIds(""), new Set());
-  assert.deepEqual(parseGrilledStoryIds("story_id\n--------\nno ids here\n"), new Set());
+test("parseClassifiedStoryIds: empty/noise/garbage → empty set (never throws)", () => {
+  assert.deepEqual(parseClassifiedStoryIds(""), new Set());
+  assert.deepEqual(parseClassifiedStoryIds("story_id\n--------\nno ids here\n"), new Set());
 });
-test("nextActionFor: grilled story → implement + packet-path prompt", () => {
+test("nextActionFor: classified story → implement + packet-path prompt", () => {
   const a = nextActionFor({ id: "US-023" }, new Set(["US-023", "US-006"]));
-  assert.equal(a.grilled, true);
+  assert.equal(a.classified, true);
   assert.equal(a.next, "implement");
   assert.match(a.prompt, /implement US-023/);
   assert.match(a.prompt, /docs\/stories\/US-023-\*\.md/);
 });
-test("nextActionFor: ungrilled story → grill + skill+id prompt", () => {
+test("nextActionFor: unclassified story → classify + skill+id prompt", () => {
   const a = nextActionFor({ id: "US-024" }, new Set(["US-023"]));
-  assert.equal(a.grilled, false);
-  assert.equal(a.next, "grill");
+  assert.equal(a.classified, false);
+  assert.equal(a.next, "classify");
   assert.match(a.prompt, /harness-intake-griller/);
   assert.match(a.prompt, /US-024/);
 });
@@ -269,9 +270,9 @@ test("dispatchPromptFor: backlog → triage prompt with #id + close/promote/refr
   assert.match(p, /promote/);
   assert.match(p, /reframe/);
 });
-test("dispatchPromptFor: matrix ungrilled → grill prompt", () => {
+test("dispatchPromptFor: matrix unclassified → classify prompt", () => {
   const p = dispatchPromptFor({ kind: "matrix", id: "US-027", title: "backlog triage" }, new Set());
-  assert.match(p, /grill US-027/);
+  assert.match(p, /classify US-027/);
   assert.match(p, /harness-intake-griller/);
 });
 test("dispatchPromptFor: matrix grilled → implement prompt with packet path", () => {
@@ -603,38 +604,38 @@ test("story detail: missing packet → '(no packet file — orphan durable)'", (
   assert.match(text, /US-999/);
 });
 console.log("=== dashboard: grilled-badge + next-action routing (US-023) ===");
-test("matrix badge: grilled row shows ●, ungrilled shows ○", () => {
+test("matrix badge: classified row shows ●, unclassified shows ○", () => {
   const rows = parseMatrixNumeric(FIXTURE_MATRIX); // US-001 / US-002 / US-003
-  const data = dashData({ matrix: rows, grilledStoryIds: new Set(["US-001"]) });
+  const data = dashData({ matrix: rows, classifiedStoryIds: new Set(["US-001"]) });
   const lines = renderDashboardLines(bareState(), nav("matrix"), data, id).join("\n").split("\n");
   const us001 = lines.find((l) => /US-001/.test(l))!;
   const us002 = lines.find((l) => /US-002/.test(l))!;
-  assert.ok(/●/.test(us001), "US-001 (grilled) row should show ●");
-  assert.ok(/○/.test(us002), "US-002 (ungrilled) row should show ○");
+  assert.ok(/●/.test(us001), "US-001 (classified) row should show ●");
+  assert.ok(/○/.test(us002), "US-002 (unclassified) row should show ○");
 });
-test("matrix badge: header carries the grilled 'g' column label", () => {
-  const data = dashData({ matrix: parseMatrixNumeric(FIXTURE_MATRIX), grilledStoryIds: new Set() });
+test("matrix badge: header carries the classified 'c' column label", () => {
+  const data = dashData({ matrix: parseMatrixNumeric(FIXTURE_MATRIX), classifiedStoryIds: new Set() });
   const headerLine = renderDashboardLines(bareState(), nav("matrix"), data, id).join("\n").split("\n").find((l) => /u i e p/.test(l))!;
-  assert.match(headerLine, /\bg\b/);
+  assert.match(headerLine, /\bc\b/);
 });
-test("story detail: grilled shows yes + next: implement + packet prompt", () => {
+test("story detail: classified shows yes + next: implement + packet prompt", () => {
   const row = { id: "US-023", title: "Dashboard grilled-badge", status: "in_progress", unit: 0, integ: 0, e2e: 0, plat: 0 };
   const data = dashData({
     matrix: [row],
-    grilledStoryIds: new Set(["US-023"]),
+    classifiedStoryIds: new Set(["US-023"]),
     packets: { "US-023": PACKET("US-023", "in_progress", "normal", "- badge.", "t=1") },
   });
   const text = renderDashboardLines(bareState(), nav("matrix", 0, { kind: "matrix", index: 0 }), data, id).join("\n");
-  assert.match(text, /grilled:.*yes/);
+  assert.match(text, /classified:.*yes/);
   assert.match(text, /next:.*implement/);
   assert.match(text, /docs\/stories\/US-023-\*\.md/);
 });
-test("story detail: ungrilled shows no + next: grill + skill prompt", () => {
+test("story detail: unclassified shows no + next: classify + skill prompt", () => {
   const row = { id: "US-024", title: "ADR reader", status: "planned", unit: 0, integ: 0, e2e: 0, plat: 0 };
-  const data = dashData({ matrix: [row], grilledStoryIds: new Set() });
+  const data = dashData({ matrix: [row], classifiedStoryIds: new Set() });
   const text = renderDashboardLines(bareState(), nav("matrix", 0, { kind: "matrix", index: 0 }), data, id).join("\n");
-  assert.match(text, /grilled:.*no/);
-  assert.match(text, /next:.*grill/);
+  assert.match(text, /classified:.*no/);
+  assert.match(text, /next:.*classify/);
   assert.match(text, /harness-intake-griller/);
 });
 console.log("=== dashboard: matrix status-filter (US-026) ===");
@@ -653,23 +654,23 @@ test("filterMatrixRows: done → only status=implemented", () => {
   const rows = parseMatrixNumeric(FIXTURE_MATRIX);
   assert.deepEqual(filterMatrixRows(rows, new Set(), "done").map((r) => r.id), ["US-001"]);
 });
-test("filterMatrixRows: ungrilled → planned AND not grilled (the grill queue)", () => {
+test("filterMatrixRows: unclassified → planned AND not classified (the classify queue)", () => {
   const rows = parseMatrixNumeric(FIXTURE_MATRIX); // US-002 is the only planned
-  assert.deepEqual(filterMatrixRows(rows, new Set(), "ungrilled").map((r) => r.id), ["US-002"]);
-  // US-002 grilled → queue empty
-  assert.deepEqual(filterMatrixRows(rows, new Set(["US-002"]), "ungrilled"), []);
+  assert.deepEqual(filterMatrixRows(rows, new Set(), "unclassified").map((r) => r.id), ["US-002"]);
+  // US-002 classified → queue empty
+  assert.deepEqual(filterMatrixRows(rows, new Set(["US-002"]), "unclassified"), []);
 });
 test("filterMatrixRows: undefined/unknown → all (identity, never throws)", () => {
   const rows = parseMatrixNumeric(FIXTURE_MATRIX);
   assert.equal(filterMatrixRows(rows, new Set(), undefined).length, 3);
 });
 
-test("reducer: `f` cycles matrix filter all→planned→ungrilled→done→all", () => {
+test("reducer: `f` cycles matrix filter all→planned→unclassified→done→all", () => {
   let st: DashboardNav = { tab: "matrix", cursor: 0, drill: null };
   st = reduceDashboardNav(st, "f", LENS(3, 0, 0)).nav;
   assert.equal(st.matrixFilter, "planned");
   st = reduceDashboardNav(st, "f", LENS(3, 0, 0)).nav;
-  assert.equal(st.matrixFilter, "ungrilled");
+  assert.equal(st.matrixFilter, "unclassified");
   st = reduceDashboardNav(st, "f", LENS(3, 0, 0)).nav;
   assert.equal(st.matrixFilter, "done");
   st = reduceDashboardNav(st, "f", LENS(3, 0, 0)).nav;
@@ -692,7 +693,7 @@ test("reducer: `f` is a no-op when drilled (Esc is the only exit)", () => {
   assert.equal(reduceDashboardNav(drilled, "f", LENS(3, 0, 0)).nav.matrixFilter, "planned");
 });
 test("reducer: tab switch resets matrixFilter to all", () => {
-  const st: DashboardNav = { tab: "matrix", cursor: 2, drill: null, matrixFilter: "ungrilled" };
+  const st: DashboardNav = { tab: "matrix", cursor: 2, drill: null, matrixFilter: "unclassified" };
   const r = reduceDashboardNav(st, "3", LENS(0, 0, 0)).nav;
   assert.equal(r.tab, "backlog");
   assert.equal(r.matrixFilter, "all");
@@ -745,11 +746,11 @@ test("render: `planned` filter narrows the matrix list to planned rows", () => {
   assert.ok(!/US-001/.test(text), "US-001 (implemented) should be filtered out");
   assert.ok(!/US-003/.test(text), "US-003 (retired) should be filtered out");
 });
-test("render: `ungrilled` empty → grill-queue-empty empty-state", () => {
-  const data = dashData({ matrix: parseMatrixNumeric(FIXTURE_MATRIX), grilledStoryIds: new Set(["US-002"]) });
-  const text = renderDashboardLines(bareState(), { tab: "matrix", cursor: 0, drill: null, matrixFilter: "ungrilled" }, data, id).join("\n");
-  assert.match(text, /grill queue empty/);
-  assert.ok(!/US-002/.test(text), "grilled US-002 should not appear in ungrilled filter");
+test("render: `unclassified` empty → classify-queue-empty empty-state", () => {
+  const data = dashData({ matrix: parseMatrixNumeric(FIXTURE_MATRIX), classifiedStoryIds: new Set(["US-002"]) });
+  const text = renderDashboardLines(bareState(), { tab: "matrix", cursor: 0, drill: null, matrixFilter: "unclassified" }, data, id).join("\n");
+  assert.match(text, /classify queue empty/);
+  assert.ok(!/US-002/.test(text), "classified US-002 should not appear in unclassified filter");
 });
 test("render: drill resolves the correct story from a filtered position", () => {
   // Under `planned`, only US-002 shows (index 0 in the filtered list). Drilling
@@ -793,7 +794,7 @@ test("story detail: provenance lane shows intake + traces", () => {
   const row = { id: "US-025", title: "Dashboard entity reframe", status: "planned", unit: 0, integ: 0, e2e: 0, plat: 0 };
   const data = dashData({
     matrix: [row],
-    grilledStoryIds: new Set(["US-025"]),
+    classifiedStoryIds: new Set(["US-025"]),
     provenance: new Map([["US-025", { intakes: [{ id: 35, inputType: "spec_slice" }], traces: [59, 54] }]]),
   });
   const text = renderDashboardLines(bareState(), nav("matrix", 0, { kind: "matrix", index: 0 }), data, id).join("\n");
@@ -1209,7 +1210,7 @@ test("US-027 dispatch: `s` on backlog → pi.sendUserMessage with triage prompt"
     rmSync(cwd, { recursive: true, force: true });
   }
 });
-test("US-027 dispatch: `s` on matrix → grill prompt (ungrilled default)", async () => {
+test("US-027 dispatch: `s` on matrix → classify prompt (unclassified default)", async () => {
   const mod = await import("../extensions/harness/index.ts");
   const cwd = installedRepo();
   try {
@@ -1217,8 +1218,8 @@ test("US-027 dispatch: `s` on matrix → grill prompt (ungrilled default)", asyn
     mod.default(pi as never);
     await registeredCommands.get("harness")!("", ctx as never);
     assert.equal(state.sentMessages.length, 1);
-    // WIRED_MATRIX row 0 = US-001; grilledStoryIds empty (intakes unmocked) → grill
-    assert.match(state.sentMessages[0]!, /grill US-001/);
+    // WIRED_MATRIX row 0 = US-001; classifiedStoryIds empty (intakes unmocked) → classify
+    assert.match(state.sentMessages[0]!, /classify US-001/);
   } finally {
     rmSync(cwd, { recursive: true, force: true });
   }
@@ -1411,6 +1412,68 @@ test("wiring: decisions tab reads docs/decisions/*.md, sorts newest-first, skips
   } finally {
     rmSync(cwd, { recursive: true, force: true });
   }
+});
+
+// ─── US-036: initiatives tab — initiative → slices hierarchy ────────────
+
+console.log("=== dashboard: US-036 initiatives hierarchy ===");
+test("parseInitiatives: groups slices by parent_intake_id, newest initiative first", () => {
+  const intakes = "44|Realign to upstream\n29|Control-surface initiative\n";
+  const slices =
+    "44|US-033|Slice link|planned\n" +
+    "44|US-036|Dashboard|planned\n" +
+    "29|US-023|Grilled badge|implemented\n";
+  const groups = parseInitiatives(intakes, slices);
+  assert.equal(groups.length, 2);
+  assert.equal(groups[0]!.intakeId, 44, "newest initiative first");
+  assert.equal(groups[0]!.summary, "Realign to upstream");
+  assert.deepEqual(groups[0]!.slices.map((s) => s.id), ["US-033", "US-036"]);
+  assert.equal(groups[1]!.intakeId, 29);
+  assert.deepEqual(groups[1]!.slices.map((s) => s.id), ["US-023"]);
+});
+test("parseInitiatives: empty/garbage → empty list (never throws)", () => {
+  assert.deepEqual(parseInitiatives("", ""), []);
+  assert.deepEqual(parseInitiatives("id\n--\nnope\n", "garbage|not|a|slice"), []);
+});
+test("initiatives tab: renders intake header + indented slices", () => {
+  const data = dashData({
+    matrix: [],
+    classifiedStoryIds: new Set(["US-036"]),
+    initiatives: [
+      {
+        intakeId: 44,
+        summary: "Realign to upstream",
+        slices: [
+          { id: "US-033", title: "Slice link", status: "planned" },
+          { id: "US-036", title: "Dashboard", status: "planned" },
+        ],
+      },
+    ],
+  });
+  const text = renderDashboardLines(bareState(), nav("initiatives"), data, id).join("\n");
+  assert.match(text, /#44/);
+  assert.match(text, /Realign to upstream/);
+  assert.match(text, /US-033/);
+  assert.match(text, /US-036/);
+});
+test("initiatives tab: empty → empty-state row", () => {
+  const data = dashData({ initiatives: [] });
+  const text = renderDashboardLines(bareState(), nav("initiatives"), data, id).join("\n");
+  assert.match(text, /no initiatives/);
+});
+test("reducer: `7` switches to the initiatives tab", () => {
+  const st: DashboardNav = { tab: "matrix", cursor: 2, drill: null };
+  assert.equal(reduceDashboardNav(st, "7", LENS(0, 0, 0)).nav.tab, "initiatives");
+});
+test("reducer: `s` on initiatives (non-empty) → action dispatch", () => {
+  const st: DashboardNav = { tab: "initiatives", cursor: 0, drill: null };
+  const lens = { matrix: 0, backlog: 0, drift: 0, timeline: 0, decisions: 0, initiatives: 2 };
+  assert.equal(reduceDashboardNav(st, "s", lens).action, "dispatch");
+});
+test("reducer: `s` on initiatives (empty) → no-op", () => {
+  const st: DashboardNav = { tab: "initiatives", cursor: 0, drill: null };
+  const lens = { matrix: 0, backlog: 0, drift: 0, timeline: 0, decisions: 0, initiatives: 0 };
+  assert.equal(reduceDashboardNav(st, "s", lens).action, undefined);
 });
 
 void run();

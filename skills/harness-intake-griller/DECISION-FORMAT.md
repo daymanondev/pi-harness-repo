@@ -1,5 +1,11 @@
 # Decision Record Format
 
+> Optional companion for **high-risk** classifications only. It is not part of
+> the clarification procedure — the grill produces understanding, not decisions.
+> Reach for this only when the automatic classification lands on `high-risk` and
+> the work changes behavior, architecture, authorization, data ownership, API
+> shape, or validation (the same bar as an ADR).
+
 Decision records live in `docs/decisions/` with sequential numbering:
 `0001-slug.md`, `0002-slug.md`, … The matching durable row is added with
 `harness-cli decision add`.

@@ -76,8 +76,9 @@ function dataWith(events: TimelineEvent[], over: Partial<DashboardData> = {}): D
     timeline: events,
     decisions: [],
     packets: {},
-    grilledStoryIds: new Set(),
+    classifiedStoryIds: new Set(),
     provenance: new Map(),
+    initiatives: [],
     errors: {},
     ...over,
   };

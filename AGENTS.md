@@ -2,10 +2,22 @@
 
 ## Project Skills
 
-Use `skills/harness-intake-griller/SKILL.md` when a request needs
-discussion, feature intake, docs, or story shaping before Symphony execution.
-The skill is bundled in this pi-harness package and declared under `pi.skills`
-in `package.json`; do not use a global copy as the source of truth.
+This repo ships two harness skills (declared under `pi.skills` in `package.json`;
+use the bundled copies, not a global one):
+
+- **`skills/harness-project-kicker`** — initiative shaper. Use when a request
+  brings a **new initiative, idea, or prompt** that needs shaping: it *sharpens*
+  the requirement, records one `new_initiative` intake, writes initiative notes,
+  decomposes into small slice stories (linked to the intake via
+  `parent_intake_id`), and drives the per-slice classify→implement→trace loop.
+  User-invoked at kickoff.
+- **`skills/harness-intake-griller`** — on-demand **clarification** tool. Use
+  when a **story or slice is ambiguous** (unclear behavior, UI/acceptance
+  questions) and understanding must be sharpened before the automatic intake
+  classification. NOT a mandatory per-slice intake gate (ADR-0015).
+
+See `docs/GLOSSARY.md` (grill vs sharpen vs classified) and
+`docs/decisions/0015-realign-grill-to-clarification.md`.
 
 <!-- HARNESS:BEGIN -->
 ## Harness

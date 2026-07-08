@@ -1,17 +1,17 @@
-# GRILL-FORMAT — requirement-level interview reference
+# SHARPEN-FORMAT — requirement-level interview reference
 
-Loaded by the grill step of `harness-project-kicker`. This is **reference, not
-steps**: consult the branch you need, ignore the rest. It is the requirement-
-level analogue of `harness-intake-griller/INTAKE-FORMAT.md`, which does the
-same job at slice granularity.
+Loaded by the **sharpen** step (step 2) of `harness-project-kicker`. This is
+**reference, not steps**: consult the branch you need, ignore the rest. It is
+the requirement-level interview; `harness-intake-griller` does the same
+probing at slice granularity, on demand, when a story is unclear.
 
 ## Why this exists
 
 A kickoff requirement is usually fuzzy: one sentence that actually contains
 many features, or a goal stated as a mechanism. The umbrella intake, the
-roadmap, and every slice inherit whatever understanding you reach here. If you
-skip this and jump to decomposition, the umbrella summary is your guess and
-the slices are a guess about a guess. Grill first.
+initiative notes, and every slice inherit whatever understanding you reach
+here. If you skip this and jump to decomposition, the umbrella summary is your
+guess and the slices are a guess about a guess. Sharpen first.
 
 ## The interview branches
 
@@ -26,7 +26,8 @@ umbrella intake is recorded.
 - If an initiative: roughly how many independent features / product areas are
   buried in it? Name them out loud.
 - Is the requirement a **goal** ("offline works") or a **mechanism** ("add a
-  service worker")? Goals decompose freely; mechanisms may already over-constrain.
+  service worker")? Goals decompose freely; mechanisms may already
+  over-constrain.
 
 **Done when:** you can say "this is N features" (or "one behaviour → redirect
 to the griller, this is not a kicker job") and name each.
@@ -58,16 +59,15 @@ list (that is the one most likely to be wrong).
 - What **assumptions** are you about to make that you should surface as a
   question instead?
 
-**Done when:** every fuzzy term is either sharpened to something checkable, or
-recorded as an open question in the roadmap.
+**Done when:** every fuzzy term is sharpened to something checkable, or
+recorded as an open question in the initiative notes.
 
 ### 5. Risk surface — the 10 flags, anywhere
 
-Go through the flag list. The question here is **coarser** than the griller's:
+Go through the flag list. The question here is **coarser** than per-slice:
 "does this flag touch the requirement **anywhere**?" — not "does it touch this
-slice?" (that is the griller's job per slice). Mark any flag that appears
-anywhere; it becomes an early lane signal and a thing to watch during
-decomposition.
+slice?" Mark any flag that appears anywhere; it becomes an early lane signal
+and a thing to watch during decomposition.
 
 `Auth` · `Authorization` · `Data model` · `Audit/security` · `External systems`
 · `Public contracts` · `Cross-platform` · `Existing behaviour` · `Weak proof`
@@ -75,17 +75,17 @@ decomposition.
 
 Hard gates (auth, authorization, data loss/migration, audit/security, external
 provider behaviour, removing validation) force the umbrella toward `high-risk`
-unless the user narrows scope during this grill.
+unless the user narrows scope during this sharpen.
 
 **Done when:** every flag is marked or explicitly cleared, with a one-line
 reason for each that applies.
 
-## The rules (same as the griller, raised one tier)
+## The rules
 
 - **One question at a time.** Wait for an answer before the next.
-- **Recommend, then confirm.** For every question, give your recommended
-  answer based on what you already know about the repo, then let the user
-  confirm or correct.
+- **Recommend, then confirm.** For every question, give your recommended answer
+  based on what you already know about the repo, then let the user confirm or
+  correct.
 - **Explore before you ask.** If a question is answerable by reading the
   codebase or querying the durable layer, do that instead. Ground yourself:
   - `scripts/bin/harness-cli query matrix` — current proof status.
@@ -95,7 +95,7 @@ reason for each that applies.
   - `rg` the codebase and `docs/product/*` for the affected surface.
 - **Record nothing per-feature here.** This phase produces **understanding**,
   not durable rows. The only durable row it produces is the single umbrella
-  intake, and only after the grill completes.
+  intake, and only after sharpening completes.
 
 ## Sharpening heuristics
 
@@ -109,32 +109,33 @@ reason for each that applies.
   this change a shape a client relies on, or only an internal call site? For
   "Existing behaviour": is the test-covered path actually exercised, or dead
   code? The goal is to neither under- nor over-classify.
-- **Borrow the griller's lane vocabulary.** "Small" is not a lane; `tiny` /
-  `normal` / `high-risk` are. Translate the user's self-classification and
-  defend it against the flag list.
+- **Borrow the lane vocabulary.** "Small" is not a lane; `tiny` / `normal` /
+  `high-risk` are. Translate the user's self-classification and defend it
+  against the flag list.
 
 ## Output — a sharpened requirement
 
-When the grill is done you hold:
+When the sharpen is done you hold:
 
 ```text
 Shape:       initiative, ~N features (named)
 Tracer-bullet: <one sentence>
 In scope:    <list>
 Out of scope:<list, user-confirmed>
-Open questions: <list, deferred to roadmap>
+Open questions: <list, deferred to initiative notes>
 Risk surface:<flags that touch anywhere, with a reason each>
 Umbrella lane signal: <tiny | normal | high-risk, provisional>
 ```
 
-**This** is what the next step turns into the one umbrella `new_initiative`
-intake summary. Not the agent's first guess — the grill's verified output.
+**This** is what step 3 turns into the one umbrella `new_initiative` intake
+summary. Not the agent's first guess — the sharpen's verified output.
 
 ## What this phase does NOT do
 
-- It does **not** decompose into slices (that is step 4, `KICK-FORMAT.md`).
-- It does **not** record per-feature intakes (that is the monolithic-spec
-  anti-pattern; each slice is intaken just-in-time by the griller).
-- It does **not** choose the final lane for each slice (that is the griller's
-  job, per slice, when it starts).
-- It does **not** write the roadmap (that is step 3) — it only feeds it.
+- It does **not** decompose into slices (that is step 5, `KICK-FORMAT.md`).
+- It does **not** record per-feature intakes (each slice is classified
+  just-in-time when it is worked; that is automatic, not a grill ceremony).
+- It does **not** choose the final lane for each slice (that is done per slice
+  when it starts).
+- It does **not** write the initiative notes (that is step 4) — it only feeds
+  them.
