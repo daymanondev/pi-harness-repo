@@ -441,6 +441,84 @@ export function formatAdrAge(lastVerifiedAt: string): string {
  * error row, so a failing query never throws out of the overlay. `matrix` keeps
  * US-010's empty-on-failure semantics (it has its own empty-state row).
  */
+
+// ─── provenance (US-025): per-story intake + trace links ───────────────────
+
+/** One intake linked to a story (the durable `intake.story_id` FK). */
+export interface StoryProvenanceIntake {
+  id: number;
+  inputType: string;
+}
+
+/** The provenance behind one story: its linked intakes + trace ids (Tier 2
+ *  evidence — US-025). Decisions are omitted: the `decision` table has no
+ *  `story_id` FK, so there is no durable per-story decision link; the DECISIONS
+ *  tab / US-024 owns decision surfacing. */
+export interface StoryProvenance {
+  intakes: StoryProvenanceIntake[];
+  /** Trace ids, latest first. */
+  traces: number[];
+}
+
+/**
+ * Parse the pipe-delimited `query sql "SELECT story_id||'|'||id||'|'||input_type
+ * FROM intake WHERE story_id IS NOT NULL …"` output into a storyId → intakes
+ * map (US-025). Pure + total: lines that don't match `US-NNN|<digits>|<type>`
+ * (header, separator, blank) are skipped; never throws on partial/garbage.
+ */
+export function parseIntakesByStory(
+  stdout: string
+): Map<string, StoryProvenanceIntake[]> {
+  const out = new Map<string, StoryProvenanceIntake[]>();
+  for (const raw of stdout.split(/\r?\n/)) {
+    const line = raw.replace(/\s+$/, "");
+    if (!line) continue;
+    const m = line.match(/^(US-\d+)\|(\d+)\|([a-z_]+)$/);
+    if (!m) continue;
+    const [, sid, idStr, inputType] = m;
+    if (!sid || !idStr || !inputType) continue;
+    const arr = out.get(sid) ?? [];
+    arr.push({ id: Number(idStr), inputType });
+    out.set(sid, arr);
+  }
+  return out;
+}
+
+/**
+ * Parse the pipe-delimited `query sql "SELECT story_id||'|'||id FROM trace WHERE
+ * story_id IS NOT NULL ORDER BY id DESC"` output into a storyId → trace-id[] map
+ * (latest first, US-025). Pure + total; skips non-matching lines.
+ */
+export function parseTracesByStory(stdout: string): Map<string, number[]> {
+  const out = new Map<string, number[]>();
+  for (const raw of stdout.split(/\r?\n/)) {
+    const line = raw.replace(/\s+$/, "");
+    if (!line) continue;
+    const m = line.match(/^(US-\d+)\|(\d+)$/);
+    if (!m) continue;
+    const [, sid, idStr] = m;
+    if (!sid || !idStr) continue;
+    const arr = out.get(sid) ?? [];
+    arr.push(Number(idStr));
+    out.set(sid, arr);
+  }
+  return out;
+}
+
+/** Merge the two per-story maps into the storyId → StoryProvenance map the detail
+ *  pane renders (US-025). Pure: the natural unit-test seam for the lane. */
+export function buildProvenance(
+  intakes: Map<string, StoryProvenanceIntake[]>,
+  traces: Map<string, number[]>
+): Map<string, StoryProvenance> {
+  const keys = new Set<string>([...intakes.keys(), ...traces.keys()]);
+  const out = new Map<string, StoryProvenance>();
+  for (const k of keys) {
+    out.set(k, { intakes: intakes.get(k) ?? [], traces: traces.get(k) ?? [] });
+  }
+  return out;
+}
+
 export interface DashboardData {
   matrix: MatrixRow[];
   stats: StatsCounts;
@@ -456,6 +534,9 @@ export interface DashboardData {
   /** Story ids linked by a `spec_slice` intake = the grilled set (US-023).
    *  Drives the Matrix grilled-badge + the detail-pane `next:` line. */
   grilledStoryIds: ReadonlySet<string>;
+  /** storyId → linked intakes + trace ids (Tier 2 provenance, US-025). Drives
+   *  the detail-pane Provenance lane. Empty map when no story has links yet. */
+  provenance: Map<string, StoryProvenance>;
   errors: Partial<Record<DashboardTab, string>>;
 }
 
@@ -509,6 +590,35 @@ export function nextActionFor(
   };
 }
 
+// ─── matrix status-filter (US-026) ─────────────────────────────────────────
+
+/** Matrix status-filter stops (US-026). `f` cycles through these in order. */
+export const MATRIX_FILTER_CYCLE = ["all", "planned", "ungrilled", "done"] as const;
+export type MatrixFilter = (typeof MATRIX_FILTER_CYCLE)[number];
+
+/**
+ * Pure matrix-row filter (US-026). Narrows the full matrix to the rows visible
+ * under a given filter stop:
+ * - `all`       — every row (identity).
+ * - `planned`   — `status = planned` (work not yet started).
+ * - `ungrilled` — the grill queue: `status = planned` AND no `spec_slice`
+ *   intake linked (the US-023 intake-linkage signal). The primary stop.
+ * - `done`      — `status = implemented`.
+ * `retired` is deliberately not a stop (low signal; stays visible under `all`).
+ * Pure + total: never throws; `undefined`/unknown filter → `all` (identity).
+ */
+export function filterMatrixRows(
+  rows: readonly MatrixRow[],
+  grilledStoryIds: ReadonlySet<string>,
+  filter: MatrixFilter | undefined
+): MatrixRow[] {
+  const f = filter ?? "all";
+  if (f === "all") return [...rows];
+  if (f === "planned") return rows.filter((r) => r.status === "planned");
+  if (f === "done") return rows.filter((r) => r.status === "implemented");
+  return rows.filter((r) => r.status === "planned" && !grilledStoryIds.has(r.id));
+}
+
 // ─── drill-down navigation (US-014) ────────────────────────────────────────
 
 /** Tabs whose body is a selectable list (cursor + drill apply). */
@@ -525,6 +635,9 @@ export interface DashboardNav {
   tab: DashboardTab;
   cursor: number;
   drill: DrillTarget | null;
+  /** US-026: matrix status-filter stop (matrix tab only; resets to "all" on
+   *  tab switch). Optional so existing `DashboardNav` literals stay valid. */
+  matrixFilter?: MatrixFilter;
 }
 
 /** Result of reducing one key: new nav + optional close/refresh action. */
@@ -605,9 +718,17 @@ export function reduceDashboardNav(
   }
   if (key === "r") return { nav, action: "refresh" };
   const t = TAB_KEYS[key];
-  if (t) return { nav: { tab: t, cursor: 0, drill: null } };
+  if (t) return { nav: { tab: t, cursor: 0, drill: null, matrixFilter: "all" } };
   // cursor / drill only apply to list tabs, and only when not already drilled
   if (nav.drill || !isListTab(nav.tab)) return { nav };
+  // US-026: `f` cycles the matrix status-filter (matrix-only; no-op on other
+  // list tabs). Resets cursor to 0 — the list content changes, so position is
+  // meaningless (mirrors the tab-switch cursor reset).
+  if (key === "f" && nav.tab === "matrix") {
+    const cur = nav.matrixFilter ?? "all";
+    const next = MATRIX_FILTER_CYCLE[(MATRIX_FILTER_CYCLE.indexOf(cur) + 1) % MATRIX_FILTER_CYCLE.length]!;
+    return { nav: { ...nav, matrixFilter: next, cursor: 0 } };
+  }
   const len = lens[nav.tab] ?? 0;
   if (isArrowUp(key) || key === "k") {
     if (len === 0) return { nav };
@@ -674,10 +795,18 @@ export function renderDashboardLines(
 
   // ── active tab content (or the drilled detail pane) ──
   const innerW = w - 2;
+  // US-026: the matrix status-filter narrows the displayed list. The filtered
+  // list is the single source of truth for BOTH the list render AND drill
+  // resolution — the drill index points into the filtered list, so renderDetail
+  // must resolve against it too. (matrixFilter resets to "all" on tab switch,
+  // so for non-matrix tabs this is the identity.)
+  const matrixFilter = nav.matrixFilter ?? "all";
+  const filteredMatrix = filterMatrixRows(data.matrix, data.grilledStoryIds, matrixFilter);
   if (nav.drill) {
-    content.push(...renderDetail(nav.drill, data, fg, innerW));
+    const drillData = nav.drill.kind === "matrix" ? { ...data, matrix: filteredMatrix } : data;
+    content.push(...renderDetail(nav.drill, drillData, fg, innerW));
   } else if (nav.tab === "matrix") {
-    content.push(...renderMatrixTab(data.matrix, data.grilledStoryIds, nav.cursor, fg, innerW));
+    content.push(...renderMatrixTab(filteredMatrix, data.grilledStoryIds, matrixFilter, nav.cursor, fg, innerW));
   } else if (nav.tab === "stats") {
     content.push(...renderStatsTab(data, fg, innerW));
   } else if (nav.tab === "backlog") {
@@ -710,6 +839,7 @@ export function renderDashboardLines(
 function renderMatrixTab(
   matrix: MatrixRow[],
   grilledStoryIds: ReadonlySet<string>,
+  filter: MatrixFilter,
   cursor: number,
   fg: FgFn,
   innerW: number
@@ -717,6 +847,15 @@ function renderMatrixTab(
   const dim = (t: string) => fg("dim", t);
   const out: string[] = [];
   const innerW2 = innerW - MARK_W;
+
+  // US-026: active-filter label + `f` discovery, always shown on the matrix
+  // list (the footer can't host `[f]` without overflowing at narrow widths).
+  out.push(
+    rowMarker(false) +
+      dim("filter:") + " " +
+      (filter === "all" ? dim(filter) : fg("accent", filter)) +
+      dim("   [f] cycle")
+  );
 
   const BADGE_W = 2; // grilled-badge glyph (●/○) + trailing space
   const idW = 7;
@@ -738,7 +877,11 @@ function renderMatrixTab(
   out.push(rowMarker(false) + head);
 
   if (matrix.length === 0) {
-    out.push(rowMarker(false) + dim("(no stories — query matrix returned nothing)"));
+    let emptyMsg = "(no stories — query matrix returned nothing)";
+    if (filter === "ungrilled") emptyMsg = "(no ungrilled stories — grill queue empty)";
+    else if (filter === "planned") emptyMsg = "(no planned stories)";
+    else if (filter === "done") emptyMsg = "(no implemented stories)";
+    out.push(rowMarker(false) + dim(emptyMsg));
     return out;
   }
 
@@ -1064,6 +1207,7 @@ function renderStoryDetail(
   row: MatrixRow,
   packet: PacketRef | undefined,
   grilledStoryIds: ReadonlySet<string>,
+  provenance: StoryProvenance | undefined,
   fg: FgFn,
   innerW: number
 ): string[] {
@@ -1085,6 +1229,25 @@ function renderStoryDetail(
       `${dim("next:")} ${action.next === "implement" ? fg("accent", "implement") : fg("warning", "grill")}`
   );
   out.push(dim("→ " + truncateAnsi(action.prompt, innerW - 2)));
+  // US-025: Provenance lane — Tier 2 evidence for THIS story (read-only). Shown
+  // for every story (independent of packet presence): intake linkage + traces.
+  // Decisions omitted — no decision.story_id FK; the DECISIONS tab owns them.
+  out.push(dim("Provenance:"));
+  const ints = provenance?.intakes ?? [];
+  out.push(
+    "  " + dim("intake:") + " " +
+      (ints.length
+        ? truncateAnsi(ints.map((i) => `#${i.id} ${i.inputType}`).join(", "), Math.max(10, innerW - 11))
+        : dim("— (no linked intake; grill first)"))
+  );
+  const trs = provenance?.traces ?? [];
+  const shown = trs.slice(0, 5);
+  const more = trs.length - shown.length;
+  out.push(
+    "  " + dim("traces:") + " " +
+      (trs.length ? shown.join(", ") + (more > 0 ? dim(` (+${more} more)`) : "") : dim("—"))
+  );
+  out.push("  " + dim("decisions: see decisions tab (US-024)"));
   if (!packet) {
     out.push(dim(`(no packet file — orphan durable; add docs/stories/${row.id}-*.md)`));
     return out;
@@ -1199,7 +1362,7 @@ function renderDetail(
   if (drill.kind === "matrix") {
     const row = data.matrix[drill.index];
     if (!row) return [fg("dim", "(row no longer exists — press r to refresh)")];
-    return renderStoryDetail(row, data.packets[row.id], data.grilledStoryIds, fg, innerW);
+    return renderStoryDetail(row, data.packets[row.id], data.grilledStoryIds, data.provenance.get(row.id), fg, innerW);
   }
   if (drill.kind === "backlog") {
     const row = data.backlog[drill.index];

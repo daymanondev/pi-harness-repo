@@ -22,11 +22,16 @@ import {
   parseStats,
   parseBacklogOpen,
   parseDecisionMeta,
+  parseIntakesByStory,
+  parseTracesByStory,
+  buildProvenance,
   parseToolsJson,
   parseAdrBody,
   reduceDashboardNav,
   renderDashboardLines,
   nextActionFor,
+  filterMatrixRows,
+  MATRIX_FILTER_CYCLE,
   needsReverify,
   formatAdrAge,
   ZERO_STATS,
@@ -34,6 +39,7 @@ import {
   type DashboardNav,
   type DashboardTab,
   type DrillTarget,
+  type MatrixFilter,
 } from "../extensions/harness/dashboard.ts";
 import { ansiVisibleWidth } from "../extensions/harness/overlay.ts";
 import type { HarnessState } from "../extensions/harness/detect.ts";
@@ -77,7 +83,7 @@ const id = (_c: string, t: string) => t; // identity fg for plain-text assertion
 
 /** Build a DashboardData with empty defaults, overridden by `over`. */
 function dashData(over: Partial<DashboardData> = {}): DashboardData {
-  return { matrix: [], stats: ZERO_STATS, backlog: [], tools: [], drift: [], timeline: [], decisions: [], packets: {}, grilledStoryIds: new Set(), errors: {}, ...over };
+  return { matrix: [], stats: ZERO_STATS, backlog: [], tools: [], drift: [], timeline: [], decisions: [], packets: {}, grilledStoryIds: new Set(), provenance: new Map(), errors: {}, ...over };
 }
 
 /** Build a DashboardNav for render assertions (cursor + drill default off). */
@@ -541,6 +547,170 @@ test("story detail: ungrilled shows no + next: grill + skill prompt", () => {
   assert.match(text, /grilled:.*no/);
   assert.match(text, /next:.*grill/);
   assert.match(text, /harness-intake-griller/);
+});
+console.log("=== dashboard: matrix status-filter (US-026) ===");
+
+test("filterMatrixRows: all → every row (identity)", () => {
+  const rows = parseMatrixNumeric(FIXTURE_MATRIX);
+  const out = filterMatrixRows(rows, new Set(), "all");
+  assert.equal(out.length, 3);
+  assert.deepEqual(out.map((r) => r.id), ["US-001", "US-002", "US-003"]);
+});
+test("filterMatrixRows: planned → only status=planned", () => {
+  const rows = parseMatrixNumeric(FIXTURE_MATRIX);
+  assert.deepEqual(filterMatrixRows(rows, new Set(), "planned").map((r) => r.id), ["US-002"]);
+});
+test("filterMatrixRows: done → only status=implemented", () => {
+  const rows = parseMatrixNumeric(FIXTURE_MATRIX);
+  assert.deepEqual(filterMatrixRows(rows, new Set(), "done").map((r) => r.id), ["US-001"]);
+});
+test("filterMatrixRows: ungrilled → planned AND not grilled (the grill queue)", () => {
+  const rows = parseMatrixNumeric(FIXTURE_MATRIX); // US-002 is the only planned
+  assert.deepEqual(filterMatrixRows(rows, new Set(), "ungrilled").map((r) => r.id), ["US-002"]);
+  // US-002 grilled → queue empty
+  assert.deepEqual(filterMatrixRows(rows, new Set(["US-002"]), "ungrilled"), []);
+});
+test("filterMatrixRows: undefined/unknown → all (identity, never throws)", () => {
+  const rows = parseMatrixNumeric(FIXTURE_MATRIX);
+  assert.equal(filterMatrixRows(rows, new Set(), undefined).length, 3);
+});
+
+test("reducer: `f` cycles matrix filter all→planned→ungrilled→done→all", () => {
+  let st: DashboardNav = { tab: "matrix", cursor: 0, drill: null };
+  st = reduceDashboardNav(st, "f", LENS(3, 0, 0)).nav;
+  assert.equal(st.matrixFilter, "planned");
+  st = reduceDashboardNav(st, "f", LENS(3, 0, 0)).nav;
+  assert.equal(st.matrixFilter, "ungrilled");
+  st = reduceDashboardNav(st, "f", LENS(3, 0, 0)).nav;
+  assert.equal(st.matrixFilter, "done");
+  st = reduceDashboardNav(st, "f", LENS(3, 0, 0)).nav;
+  assert.equal(st.matrixFilter, "all"); // wraps done→all
+});
+test("reducer: `f` resets cursor to 0 (list content changes)", () => {
+  const st: DashboardNav = { tab: "matrix", cursor: 2, drill: null };
+  const r = reduceDashboardNav(st, "f", LENS(3, 0, 0)).nav;
+  assert.equal(r.cursor, 0);
+  assert.equal(r.matrixFilter, "planned");
+});
+test("reducer: `f` is a no-op on non-matrix list tabs (backlog)", () => {
+  const st: DashboardNav = { tab: "backlog", cursor: 0, drill: null };
+  const r = reduceDashboardNav(st, "f", LENS(0, 3, 0)).nav;
+  assert.equal(r.matrixFilter, undefined);
+  assert.equal(r.cursor, 0);
+});
+test("reducer: `f` is a no-op when drilled (Esc is the only exit)", () => {
+  const drilled: DashboardNav = { tab: "matrix", cursor: 1, drill: { kind: "matrix", index: 1 }, matrixFilter: "planned" };
+  assert.equal(reduceDashboardNav(drilled, "f", LENS(3, 0, 0)).nav.matrixFilter, "planned");
+});
+test("reducer: tab switch resets matrixFilter to all", () => {
+  const st: DashboardNav = { tab: "matrix", cursor: 2, drill: null, matrixFilter: "ungrilled" };
+  const r = reduceDashboardNav(st, "3", LENS(0, 0, 0)).nav;
+  assert.equal(r.tab, "backlog");
+  assert.equal(r.matrixFilter, "all");
+});
+test("reducer: `r` refresh preserves the active matrixFilter", () => {
+  const st: DashboardNav = { tab: "matrix", cursor: 0, drill: null, matrixFilter: "planned" };
+  const res = reduceDashboardNav(st, "r", LENS(3, 0, 0));
+  assert.equal(res.action, "refresh");
+  assert.equal(res.nav.matrixFilter, "planned");
+});
+
+test("render: matrix body shows the active-filter label + [f] discovery", () => {
+  const data = dashData({ matrix: parseMatrixNumeric(FIXTURE_MATRIX) });
+  const text = renderDashboardLines(bareState(), { tab: "matrix", cursor: 0, drill: null, matrixFilter: "planned" }, data, id).join("\n");
+  assert.match(text, /filter: planned/);
+  assert.match(text, /\[f\] cycle/);
+});
+test("render: `planned` filter narrows the matrix list to planned rows", () => {
+  const data = dashData({ matrix: parseMatrixNumeric(FIXTURE_MATRIX) });
+  const text = renderDashboardLines(bareState(), { tab: "matrix", cursor: 0, drill: null, matrixFilter: "planned" }, data, id).join("\n");
+  assert.match(text, /US-002/);
+  assert.ok(!/US-001/.test(text), "US-001 (implemented) should be filtered out");
+  assert.ok(!/US-003/.test(text), "US-003 (retired) should be filtered out");
+});
+test("render: `ungrilled` empty → grill-queue-empty empty-state", () => {
+  const data = dashData({ matrix: parseMatrixNumeric(FIXTURE_MATRIX), grilledStoryIds: new Set(["US-002"]) });
+  const text = renderDashboardLines(bareState(), { tab: "matrix", cursor: 0, drill: null, matrixFilter: "ungrilled" }, data, id).join("\n");
+  assert.match(text, /grill queue empty/);
+  assert.ok(!/US-002/.test(text), "grilled US-002 should not appear in ungrilled filter");
+});
+test("render: drill resolves the correct story from a filtered position", () => {
+  // Under `planned`, only US-002 shows (index 0 in the filtered list). Drilling
+  // index 0 must open US-002, NOT US-001 (index 0 in the FULL list).
+  const data = dashData({
+    matrix: parseMatrixNumeric(FIXTURE_MATRIX),
+    packets: { "US-002": PACKET("US-002", "planned", "normal", "- ac.", "ev") },
+  });
+  const text = renderDashboardLines(bareState(), { tab: "matrix", cursor: 0, drill: { kind: "matrix", index: 0 }, matrixFilter: "planned" }, data, id).join("\n");
+  assert.match(text, /US-002/);
+  assert.match(text, /Manager roles/);
+  assert.ok(!/Auth login/.test(text), "must not show US-001 (full-list index 0)");
+});
+
+console.log("=== dashboard: provenance lane (US-025) ===");
+test("parseIntakesByStory: groups pipe-delimited rows by story_id", () => {
+  const sql = "story_id\n--------\nUS-025|35|spec_slice\nUS-023|30|spec_slice\nUS-025|9|harness_improvement\n";
+  const m = parseIntakesByStory(sql);
+  assert.deepEqual(m.get("US-025"), [{ id: 35, inputType: "spec_slice" }, { id: 9, inputType: "harness_improvement" }]);
+  assert.deepEqual(m.get("US-023"), [{ id: 30, inputType: "spec_slice" }]);
+});
+test("parseIntakesByStory: empty/noise/garbage → empty map (never throws)", () => {
+  assert.deepEqual(parseIntakesByStory(""), new Map());
+  assert.deepEqual(parseIntakesByStory("story_id\n--------\nUS-006\n123|bad\n"), new Map());
+});
+test("parseTracesByStory: groups trace ids by story_id", () => {
+  const sql = "US-025|59\nUS-023|57\nUS-025|54\n";
+  const m = parseTracesByStory(sql);
+  assert.deepEqual(m.get("US-025"), [59, 54]);
+  assert.deepEqual(m.get("US-023"), [57]);
+});
+test("buildProvenance: merges intake + trace maps, union of keys", () => {
+  const ints = new Map([["US-025", [{ id: 35, inputType: "spec_slice" }]]]);
+  const trs = new Map([["US-025", [59, 54]], ["US-024", [60]]]);
+  const p = buildProvenance(ints, trs);
+  assert.deepEqual(p.get("US-025"), { intakes: [{ id: 35, inputType: "spec_slice" }], traces: [59, 54] });
+  assert.deepEqual(p.get("US-024"), { intakes: [], traces: [60] });
+  assert.equal(p.has("US-999"), false);
+});
+test("story detail: provenance lane shows intake + traces", () => {
+  const row = { id: "US-025", title: "Dashboard entity reframe", status: "planned", unit: 0, integ: 0, e2e: 0, plat: 0 };
+  const data = dashData({
+    matrix: [row],
+    grilledStoryIds: new Set(["US-025"]),
+    provenance: new Map([["US-025", { intakes: [{ id: 35, inputType: "spec_slice" }], traces: [59, 54] }]]),
+  });
+  const text = renderDashboardLines(bareState(), nav("matrix", 0, { kind: "matrix", index: 0 }), data, id).join("\n");
+  assert.match(text, /Provenance:/);
+  assert.match(text, /intake:.*#35 spec_slice/);
+  assert.match(text, /traces:.*59.*54/);
+  assert.match(text, /decisions: see decisions tab/);
+});
+test("story detail: no provenance → dim intake — + traces —", () => {
+  const row = { id: "US-999", title: "Ghost", status: "planned", unit: 0, integ: 0, e2e: 0, plat: 0 };
+  const data = dashData({ matrix: [row], provenance: new Map() });
+  const text = renderDashboardLines(bareState(), nav("matrix", 0, { kind: "matrix", index: 0 }), data, id).join("\n");
+  assert.match(text, /Provenance:/);
+  assert.match(text, /no linked intake/);
+  assert.match(text, /traces:.*—/);
+});
+test("story detail: intake but no traces", () => {
+  const row = { id: "US-026", title: "Next + grill-queue", status: "planned", unit: 0, integ: 0, e2e: 0, plat: 0 };
+  const data = dashData({
+    matrix: [row],
+    provenance: new Map([["US-026", { intakes: [{ id: 40, inputType: "spec_slice" }], traces: [] }]]),
+  });
+  const text = renderDashboardLines(bareState(), nav("matrix", 0, { kind: "matrix", index: 0 }), data, id).join("\n");
+  assert.match(text, /intake:.*#40 spec_slice/);
+  assert.match(text, /traces:.*—/);
+});
+test("story detail: traces cap at 5 with (+N more)", () => {
+  const row = { id: "US-023", title: "Grilled badge", status: "implemented", unit: 1, integ: 1, e2e: 0, plat: 0 };
+  const data = dashData({
+    matrix: [row],
+    provenance: new Map([["US-023", { intakes: [], traces: [60, 59, 58, 57, 56, 55, 54] }]]),
+  });
+  const text = renderDashboardLines(bareState(), nav("matrix", 0, { kind: "matrix", index: 0 }), data, id).join("\n");
+  assert.match(text, /\+2 more/);
 });
 test("backlog detail: renders full fields + detail tail", () => {
   const row = { id: 5, title: "Dashboard view-only", status: "proposed", risk: "normal", detail: "Turns gauge into control surface." };

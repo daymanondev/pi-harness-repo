@@ -77,6 +77,7 @@ function dataWith(events: TimelineEvent[], over: Partial<DashboardData> = {}): D
     decisions: [],
     packets: {},
     grilledStoryIds: new Set(),
+    provenance: new Map(),
     errors: {},
     ...over,
   };
@@ -258,7 +259,7 @@ const LENS = { matrix: 0, backlog: 0, drift: 0, timeline: 3, decisions: 0 };
 
 test("'t' switches to the timeline tab (resets cursor + drill)", () => {
   const res = reduceDashboardNav({ tab: "matrix", cursor: 5, drill: null }, "t", LENS);
-  assert.deepEqual(res.nav, { tab: "timeline", cursor: 0, drill: null });
+  assert.deepEqual(res.nav, { tab: "timeline", cursor: 0, drill: null, matrixFilter: "all" });
 });
 
 test("j/k move the cursor on the timeline tab, clamped", () => {

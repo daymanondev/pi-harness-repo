@@ -62,10 +62,14 @@ import {
   parseStats,
   parseBacklogOpen,
   parseDecisionMeta,
+  parseIntakesByStory,
+  parseTracesByStory,
+  buildProvenance,
   parseToolsJson,
   readTimelineTail,
   reduceDashboardNav,
   renderDashboardLines,
+  filterMatrixRows,
   type DashboardData,
   type DashboardNav,
   type DashboardTab,
@@ -73,6 +77,7 @@ import {
   type PacketRef,
   type StatsCounts,
   type AdrRow,
+  type StoryProvenance,
   type BacklogRow,
   type DecisionMeta,
   type ToolRow,
@@ -329,8 +334,8 @@ class HarnessOverlayComponent {
     this.flags = o.flags;
     this.fg = o.fg;
     this.onDone = o.onDone;
-    this.nav = { tab: o.tab ?? "matrix", cursor: 0, drill: null };
-    this.data = o.data ?? { matrix: [], stats: ZERO_STATS, backlog: [], tools: [], drift: [], timeline: [], decisions: [], packets: {}, grilledStoryIds: new Set(), errors: {} };
+    this.nav = { tab: o.tab ?? "matrix", cursor: 0, drill: null, matrixFilter: "all" };
+    this.data = o.data ?? { matrix: [], stats: ZERO_STATS, backlog: [], tools: [], drift: [], timeline: [], decisions: [], packets: {}, grilledStoryIds: new Set(), provenance: new Map(), errors: {} };
   }
 
   handleInput(data: string): void {
@@ -350,8 +355,11 @@ class HarnessOverlayComponent {
       return;
     }
     // DASHBOARD — delegate the full key model to the pure reducer (US-014)
+    // US-026: lens.matrix is the FILTERED length so cursor/drill clamp to the
+    // visible list, not the full matrix. Computed from the current filter.
+    const filteredMatrix = filterMatrixRows(this.data.matrix, this.data.grilledStoryIds, this.nav.matrixFilter);
     const lens = {
-      matrix: this.data.matrix.length,
+      matrix: filteredMatrix.length,
       backlog: this.data.backlog.length,
       drift: this.data.drift.length,
       timeline: this.data.timeline.length,
@@ -469,6 +477,30 @@ async function fetchGrilledStoryIds(
     return res.code === 0 ? parseGrilledStoryIds(res.stdout) : new Set();
   } catch {
     return new Set();
+  }
+}
+
+/** Fetch the per-story provenance map (US-025): intakes-by-story + traces-by-
+ *  story, merged. Never throws — a failed query yields an empty map so the
+ *  Provenance lane degrades to dim `—`. Read-only: two SELECTs, no writes. */
+async function fetchProvenance(
+  pi: ExtensionAPI,
+  ctx: ExtensionCommandContext
+): Promise<Map<string, StoryProvenance>> {
+  try {
+    const bin = cliBinaryPath(ctx.cwd);
+    const sql = (q: string) =>
+      pi.exec(bin, ["query", "sql", q], { cwd: ctx.cwd, signal: ctx.signal, timeout: 5_000 });
+    const [intakesRes, tracesRes] = await Promise.all([
+      sql("SELECT story_id||'|'||id||'|'||input_type FROM intake WHERE story_id IS NOT NULL ORDER BY story_id, id"),
+      sql("SELECT story_id||'|'||id FROM trace WHERE story_id IS NOT NULL ORDER BY id DESC"),
+    ]);
+    return buildProvenance(
+      intakesRes.code === 0 ? parseIntakesByStory(intakesRes.stdout) : new Map(),
+      tracesRes.code === 0 ? parseTracesByStory(tracesRes.stdout) : new Map()
+    );
+  } catch {
+    return new Map();
   }
 }
 
@@ -653,7 +685,7 @@ async function fetchDashboardData(
   pi: ExtensionAPI,
   ctx: ExtensionCommandContext
 ): Promise<DashboardData> {
-  const [matrix, stats, backlog, tools, drift, packets, timeline, grilledStoryIds, decisions] = await Promise.all([
+  const [matrix, stats, backlog, tools, drift, packets, timeline, grilledStoryIds, decisions, provenance] = await Promise.all([
     fetchMatrix(pi, ctx),
     fetchStatsCounts(pi, ctx),
     fetchBacklogRows(pi, ctx),
@@ -663,6 +695,7 @@ async function fetchDashboardData(
     fetchTimeline(pi, ctx),
     fetchGrilledStoryIds(pi, ctx),
     fetchDecisions(pi, ctx),
+    fetchProvenance(pi, ctx),
   ]);
   const errors: Partial<Record<DashboardTab, string>> = {};
   if (stats === null) errors.stats = "stats";
@@ -681,6 +714,7 @@ async function fetchDashboardData(
     decisions: decisions ?? [],
     packets,
     grilledStoryIds,
+    provenance,
     errors,
   };
 }
