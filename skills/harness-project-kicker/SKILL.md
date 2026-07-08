@@ -11,6 +11,14 @@ roadmap (NOT a monolithic spec), a list of small **slice** stories, and a
 **driven per-slice loop**. The kicker never writes code and never writes a
 monolithic spec.
 
+> **Which skill?** This is the **requirement-level** flow: it *sharpens* a
+> whole initiative and decomposes it into slices. To classify + record **one
+> already-decomposed slice**, use
+> [`harness-intake-griller`](../harness-intake-griller/SKILL.md). Per
+> `docs/GLOSSARY.md`: **sharpen** = understand a requirement (this skill, no
+> durable row); **grill** = classify + record a slice (griller, produces the
+> `spec_slice` intake).
+
 ## When to reach for this skill
 
 Run this at the **start** of a new project (or when a new initiative arrives

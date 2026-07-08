@@ -24,6 +24,23 @@ docs, design notes, and validation expectations for a feature.
 The classification step that turns a prompt into tiny, normal, or high-risk
 work before implementation begins.
 
+## Grill
+
+The act of turning **one slice** into a classified, recorded intake — i.e.
+running `harness-intake-griller`. The durable outcome is a `spec_slice` intake
+linked to the story; that linkage **is** the dashboard "grilled" signal
+(US-023 grilled-badge, detail-pane `next:` router, drift Gate B′). Grill =
+classify + record, at slice granularity. Contrast **Sharpen**.
+
+## Sharpen
+
+The act of **understanding a requirement** before any slice is recorded —
+i.e. the grill phase of `harness-project-kicker` (ADR-0012), at requirement
+granularity. Sharpening produces understanding (shape, tracer-bullet, scope,
+risk surface), **not** durable rows; each slice is then *grilled* just-in-time
+by the griller. The two terms exist to keep slice-level classify-and-record
+(grill) distinct from requirement-level understand (sharpen).
+
 ## Component Taxonomy
 
 A map from Harness files and capabilities to the responsibilities they serve,
