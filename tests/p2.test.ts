@@ -201,10 +201,23 @@ console.log("=== drift: parsers ===");
 test("parseMatrix extracts statuses (spaces in title)", () => {
   const out = parseMatrix(
     "id  title           status       unit\n" +
-      "US-001  P1 detect foo  implemented  yes\n" +
-      "US-002  bar baz quux    planned      no\n"
+      "US-001  P1 detect foo  implemented  yes  yes  no  no\n" +
+      "US-002  bar baz quux    planned      no  no  no  no\n"
   );
   assert.deepEqual(out, { "US-001": "implemented", "US-002": "planned" });
+});
+test("parseMatrix reads status only from the status column (#12)", () => {
+  // Evidence "Replaced the planned legacy path" must NOT be mis-read as 'planned'.
+  const out = parseMatrix(
+    "US-099  T  implemented  yes  yes  no  no  Replaced the planned legacy path\n"
+  );
+  assert.equal(out["US-099"], "implemented");
+});
+test("parseMatrix: retired row whose evidence contains 'implemented' (#12)", () => {
+  const out = parseMatrix(
+    "US-100  T  retired  no  no  no  no  Was implemented before replacement\n"
+  );
+  assert.equal(out["US-100"], "retired");
 });
 test("parseMarkdownStatus reads ## Status", () => {
   assert.equal(parseMarkdownStatus("# US-001\n\n## Status\n\nimplemented\n\n## Evidence"), "implemented");
@@ -257,7 +270,7 @@ function driftFixture(
 
 test("clean: no drift", async () => {
   const r = await driftFixture(
-    "US-001  foo  implemented\n",
+    "US-001  foo  implemented  yes  yes  no  no\n",
     { "US-001-foo.md": "## Status\n\nimplemented\n\n## Evidence\n\n- tsc clean\n" }
   );
   assert.equal(r.length, 0, JSON.stringify(r));
@@ -265,7 +278,7 @@ test("clean: no drift", async () => {
 
 test("status_mismatch", async () => {
   const r = await driftFixture(
-    "US-001  foo  implemented\n",
+    "US-001  foo  implemented  yes  yes  no  no\n",
     { "US-001-foo.md": "## Status\n\nin_progress\n\n## Evidence\n\n- x\n" }
   );
   assert.equal(r.length, 1);
@@ -274,7 +287,7 @@ test("status_mismatch", async () => {
 });
 
 test("orphan_markdown (file, no durable row)", async () => {
-  const r = await driftFixture("US-001  foo  implemented\n", {
+  const r = await driftFixture("US-001  foo  implemented  yes  yes  no  no\n", {
     "US-001-foo.md": "## Status\n\nimplemented\n\n## Evidence\n\n- x\n",
     "US-002-bar.md": "## Status\n\nplanned\n\n## Evidence\n\n- x\n",
   });
@@ -285,7 +298,7 @@ test("orphan_markdown (file, no durable row)", async () => {
 
 test("orphan_durable (active row, no file)", async () => {
   const r = await driftFixture(
-    "US-001  foo  implemented\nUS-002  bar  planned\n",
+    "US-001  foo  implemented  yes  yes  no  no\nUS-002  bar  in_progress  no  no  no  no\n",
     {
       "US-001-foo.md": "## Status\n\nimplemented\n\n## Evidence\n\n- x\n",
     }
@@ -297,7 +310,7 @@ test("orphan_durable (active row, no file)", async () => {
 
 test("retired durable without file is NOT drift", async () => {
   const r = await driftFixture(
-    "US-001  foo  retired\n",
+    "US-001  foo  retired  no  no  no  no\n",
     {}
   );
   assert.equal(r.length, 0, JSON.stringify(r));
@@ -305,7 +318,7 @@ test("retired durable without file is NOT drift", async () => {
 
 test("missing_evidence on implemented story", async () => {
   const r = await driftFixture(
-    "US-001  foo  implemented\n",
+    "US-001  foo  implemented  yes  yes  no  no\n",
     { "US-001-foo.md": "## Status\n\nimplemented\n\n## Evidence\n\nTo be added\n" }
   );
   assert.equal(r.length, 1);
@@ -314,7 +327,7 @@ test("missing_evidence on implemented story", async () => {
 
 test("planned story without evidence is NOT drift", async () => {
   const r = await driftFixture(
-    "US-001  foo  planned\n",
+    "US-001  foo  planned  no  no  no  no\n",
     { "US-001-foo.md": "## Status\n\nplanned\n\n## Evidence\n\nTo be added\n" }
   );
   assert.equal(r.length, 0, JSON.stringify(r));
@@ -373,7 +386,7 @@ test("full gate lifecycle: intake block -> clear -> drift block -> clear", async
   // US-002: markdown says in_progress but durable (matrix) will say implemented => drift
   const driftedPacket = join(cwd, "docs", "stories", "US-002-bar.md");
   writeFileSync(driftedPacket, "# US-002\n\n## Status\n\nin_progress\n\n## Evidence\n\n- proof\n");
-  const matrixOut = () => "US-001  foo  implemented\nUS-002  bar  implemented\n";
+  const matrixOut = () => "US-001  foo  implemented  yes  yes  no  no\nUS-002  bar  implemented  yes  yes  no  no\n";
 
   try {
     // mock ExtensionAPI: capture handlers + canned exec

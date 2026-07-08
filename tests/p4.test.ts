@@ -415,11 +415,19 @@ test("computeDrift: orphan_markdown (file exists, no durable row)", () => {
   assert.equal(r[0]!.fixHint, fixHintFor("orphan_markdown"));
 });
 test("computeDrift: orphan_durable for active rows; retired row is NOT drift", () => {
-  const r = computeDrift({ "US-7": "planned", "US-8": "retired" }, {});
+  const r = computeDrift({ "US-7": "in_progress", "US-8": "retired" }, {});
   assert.equal(r.length, 1);
   assert.equal(r[0]!.kind, "orphan_durable");
   assert.equal(r[0]!.storyId, "US-7");
   assert.equal(r[0]!.markdown, "(no file)");
+});
+test("computeDrift: planned durable without packet is NOT drift (US-039 #6)", () => {
+  assert.deepEqual(computeDrift({ "US-1": "planned" }, {}), []);
+});
+test("computeDrift: in_progress durable without packet IS orphan_durable (US-039 #6)", () => {
+  const r = computeDrift({ "US-1": "in_progress" }, {});
+  assert.equal(r.length, 1);
+  assert.equal(r[0]!.kind, "orphan_durable");
 });
 test("computeDrift: missing_evidence only for implemented stories", () => {
   const r = computeDrift(
@@ -1071,7 +1079,12 @@ test("drift tab ('5'): surfaces markdown↔durable drift on the live fixture", a
   // no packet at all (orphan_durable) — the same class Gate B′ blocks on.
   writeFileSync(join(cwd, "docs", "stories", "US-001-foo.md"), "# US-001\n\n## Status\n\nplanned\n");
   try {
-    const { pi, ctx, state, registeredCommands } = mockHarness(cwd, { keySeqs: [["5", "\u001b"]] });
+    // US-010 as in_progress (not planned) — planned without a packet is no longer
+    // orphan_durable after US-039 #6; in_progress still is.
+    const driftMatrix =
+      "US-001  P1 detect + footer      implemented  1  1  0  0\n" +
+      "US-010  P4 dashboard shell      in_progress  0  0  0  0\n";
+    const { pi, ctx, state, registeredCommands } = mockHarness(cwd, { keySeqs: [["5", "\u001b"]], matrixStdout: driftMatrix });
     mod.default(pi as never);
     await registeredCommands.get("harness")!("", ctx as never);
     const driftRender = state.renders[0]![1]!;

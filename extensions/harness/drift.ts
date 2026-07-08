@@ -27,7 +27,7 @@ export type StoryStatus = (typeof STORY_STATUSES)[number];
 export type DriftKind =
   | "status_mismatch" // durable.status ≠ markdown ## Status
   | "orphan_markdown" // file exists, no durable row
-  | "orphan_durable" // durable row (planned/in_progress/implemented), no file
+  | "orphan_durable" // durable row (in_progress/implemented/changed), no file
   | "missing_evidence"; // markdown Evidence section empty/stale
 
 export interface DriftRecord {
@@ -49,24 +49,31 @@ export type ReadFileFn = (path: string) => Promise<string>;
 /**
  * Parse `harness-cli query matrix` into a map storyId → status.
  *
- * The matrix is a whitespace-aligned table whose `title` column contains
- * spaces, so naive column splitting fails. Instead, for each line that starts
- * with `US-\d+`, we find the FIRST story-status token present anywhere in the
- * line. (Titles never contain these exact enum words.)
+ * The matrix is a whitespace-aligned table: `US-NNN  <title>  <status>
+ * <yes/no (or 0/1)> ×4  [evidence]`. The title column contains spaces and the trailing
+ * evidence column can contain status-enum words (e.g. "Replaced the planned
+ * legacy path"), so scanning the whole line for enum words mis-parses status.
+ * Instead the enum token is anchored to the dedicated status column — it must
+ * sit after the title (2+ space gap) and immediately before the four yes/no
+ * proof columns — mirroring `parseMatrixNumeric` in dashboard.ts (which anchors
+ * on 0/1 proof columns). Lines that don't match the anchored shape fall back to
+ * '(unknown)'; title/evidence are never scanned for enum words.
  */
 export function parseMatrix(stdout: string): Record<string, string> {
   const out: Record<string, string> = {};
   for (const line of stdout.split(/\r?\n/)) {
-    const m = line.match(/^(US-\d+)/);
-    if (!m) continue;
-    const id = m[1]!;
+    const idMatch = line.match(/^(US-\d+)/);
+    if (!idMatch) continue;
+    const id = idMatch[1]!;
     let status = "(unknown)";
-    for (const s of STORY_STATUSES) {
-      if (line.includes(s)) {
-        status = s;
-        break;
-      }
-    }
+    // Column-anchored: the enum token must sit after the title (2+ space gap)
+    // and immediately before the four yes/no proof columns. This prevents
+    // evidence text (e.g. "Replaced the planned legacy path") from being
+    // mis-read as the status (backlog #12). Mirrors parseMatrixNumeric.
+    const m = line.match(
+      /^(?:US-\d+)\s+(?:.+?)\s{2,}(planned|in_progress|implemented|changed|retired)(?:\s+(?:yes|no|[01])\b){4}/
+    );
+    if (m) status = m[1]!;
     out[id] = status;
   }
   return out;
@@ -114,10 +121,12 @@ export type DurableStatusMap = Record<string, string>;
 /** storyId → parsed markdown packet. */
 export type MarkdownStoryMap = Record<string, MarkdownStory>;
 
-/** Active durable statuses that MUST have a packet. `retired` is the sanctioned
- *  "packet removed" path, so a retired row with no file is NOT drift. */
+/** Active durable statuses that MUST have a packet. `planned` is excluded — a
+ *  not-yet-started planned slice legitimately has no packet yet (the packet is
+ *  written when the slice moves to in_progress, per ADR-0015). `retired` is the
+ *  sanctioned "packet removed" path, so a retired row with no file is NOT
+ *  drift. */
 const ACTIVE_WITHOUT_PACKET = new Set([
-  "planned",
   "in_progress",
   "implemented",
   "changed",

@@ -93,7 +93,10 @@ harness-cli query sql "UPDATE story SET parent_intake_id=<INTAKE_ID> WHERE id='U
 
 `parent_intake_id` (migration 009) is the durable slice→initiative link the
 dashboard groups on. No CLI flag for it (prebuilt binary, ADR-0005) → set via
-`query sql` (write-capable). Then **do not stop after slice 1** — drive:
+`query sql` (write-capable). A story packet (`docs/stories/US-NNN-*.md`) is
+written when the slice moves to in_progress (classify→implement→trace), not at
+kickoff; planned candidates need no packet (ADR-0015 just-in-time model). Then
+**do not stop after slice 1** — drive:
 
 ```
 slice N -> classify (intake --type spec_slice --story US-NNN) [griller only if unclear]
