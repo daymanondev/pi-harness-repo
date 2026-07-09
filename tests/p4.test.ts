@@ -384,6 +384,16 @@ test("buildStoryMenu: unclassified → 'Start — classify'; no packet → dispa
   assert.equal(items[0]!.action.kind, "dispatch");
 });
 
+test("buildStoryMenu: implemented → no Start item (status-aware, US-044)", () => {
+  const row = { id: "US-040", title: "done", status: "implemented", unit: 1, integ: 1, e2e: 0, plat: 0 };
+  const packet = { filename: "US-040-foo.md", text: "see docs/decisions/0008-x.md" };
+  const items: MenuItem[] = buildStoryMenu(row, packet, new Set(["US-040"]), undefined);
+  assert.ok(!items.some((i) => i.action.kind === "dispatch"), "no Start on implemented");
+  assert.equal(items[0]!.label, "Open story packet");
+  // implemented + no packet → dispatch-less menu is empty
+  assert.equal(buildStoryMenu(row, undefined, new Set(["US-040"]), undefined).length, 0);
+});
+
 test("buildBacklogMenu: a single 'Start — triage #<id>' dispatch item", () => {
   const items: MenuItem[] = buildBacklogMenu({ id: 7, title: "x", status: "proposed", risk: "tiny", detail: "" });
   assert.equal(items.length, 1);
@@ -661,6 +671,20 @@ test("story detail: unclassified shows no + next: classify + skill prompt", () =
   assert.match(text, /classified:.*no/);
   assert.match(text, /next:.*classify/);
   assert.match(text, /harness-intake-griller/);
+});
+test("story detail: implemented → next:done, no Start, no Actions when menu empty (US-044)", () => {
+  const row = { id: "US-040", title: "Declutter", status: "implemented", unit: 1, integ: 1, e2e: 0, plat: 0 };
+  const data = dashData({
+    matrix: [row],
+    classifiedStoryIds: new Set(["US-040"]),
+    packets: { "US-040": PACKET("US-040", "implemented", "normal", "- ac.", "ev") },
+  });
+  const text = renderDashboardLines(bareState(), nav("matrix", 0, { kind: "matrix", index: 0 }), data, id).join("\n");
+  assert.match(text, /next:.*done/);
+  assert.ok(!/Start —/.test(text), "no Start hint on implemented");
+  // implemented + no packet → empty menu → no Actions block at all
+  const t2 = renderDashboardLines(bareState(), nav("matrix", 0, { kind: "matrix", index: 0 }), dashData({ matrix: [row], classifiedStoryIds: new Set(["US-040"]) }), id).join("\n");
+  assert.ok(!/Actions:/.test(t2), "no empty Actions block when menu empty");
 });
 console.log("=== dashboard: matrix status-filter (US-026) ===");
 
@@ -1149,12 +1173,13 @@ test("US-043 dispatch: matrix drill+select → classify prompt (unclassified def
   const mod = await import("../extensions/harness/index.ts");
   const cwd = installedRepo();
   try {
-    // Enter → drill matrix row 0, Enter → select menu item 0 (dispatch)
-    const { pi, ctx, state, registeredCommands } = mockHarness(cwd, { keySeqs: [["\r", "\r"]] });
+    // ↓ → cursor on US-010 (planned; row 0 US-001 is implemented → no Start per
+    // US-044), Enter → drill, Enter → select menu item 0 (dispatch → classify)
+    const { pi, ctx, state, registeredCommands } = mockHarness(cwd, { keySeqs: [["\x1b[B", "\r", "\r"]] });
     mod.default(pi as never);
     await registeredCommands.get("harness")!("", ctx as never);
     assert.equal(state.sentMessages.length, 1);
-    assert.match(state.sentMessages[0]!, /classify US-001/);
+    assert.match(state.sentMessages[0]!, /classify US-010/);
   } finally {
     rmSync(cwd, { recursive: true, force: true });
   }

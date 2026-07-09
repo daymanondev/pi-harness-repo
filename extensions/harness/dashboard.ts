@@ -448,10 +448,13 @@ export function buildStoryMenu(
 ): MenuItem[] {
   const items: MenuItem[] = [];
   const act = nextActionFor(row, classifiedStoryIds);
-  items.push({
-    label: act.next === "implement" ? `Start — implement ${row.id}` : `Start — classify ${row.id}`,
-    action: { kind: "dispatch" },
-  });
+  // US-044: an implemented story is done — no Start item (only doc options).
+  if (row.status !== "implemented") {
+    items.push({
+      label: act.next === "implement" ? `Start — implement ${row.id}` : `Start — classify ${row.id}`,
+      action: { kind: "dispatch" },
+    });
+  }
   if (packet) {
     const ownPath = `docs/stories/${packet.filename}`;
     items.push({ label: "Open story packet", action: { kind: "openDoc", path: ownPath } });
@@ -1008,11 +1011,12 @@ function renderStoryDetail(
   // Advisory only; the operator runs the prompt in his own pane. Shown for
   // every story (classified-ness is independent of packet presence).
   const action = nextActionFor(row, classifiedStoryIds);
+  const implemented = row.status === "implemented";
   out.push(
     `${dim("classified:")} ${action.classified ? fg("success", "yes") : dim("no")}   ` +
-      `${dim("next:")} ${action.next === "implement" ? fg("accent", "implement") : fg("warning", "classify")}`
+      `${dim("next:")} ${implemented ? fg("success", "done") : action.next === "implement" ? fg("accent", "implement") : fg("warning", "classify")}`
   );
-  out.push(dim("→ " + truncateAnsi(action.prompt, innerW - 2)));
+  if (!implemented) out.push(dim("→ " + truncateAnsi(action.prompt, innerW - 2)));
   // US-025: Provenance lane — Tier 2 evidence for THIS story (read-only). Shown
   // for every story (independent of packet presence): intake linkage + traces.
   out.push(dim("Provenance:"));
@@ -1043,9 +1047,11 @@ function renderStoryDetail(
     out.push(dim("Evidence:"));
     out.push(...(ev ? sectionLines(ev, 2, innerW - 2, fg) : [dim("  (empty — not yet recorded)")]));
   }
-  // US-043: navigable action menu — the only way to start / open a doc. Always
-  // rendered (an orphan can still be classified); the marker tracks menuCursor.
-  out.push(...renderActionMenu(buildStoryMenu(row, packet, classifiedStoryIds, parentIntakeId), menuCursor, fg, innerW));
+  // US-043: navigable action menu — the only way to start / open a doc.
+  // US-044: an implemented story has no Start item; if that leaves the menu
+  // empty (no packet + no related docs), skip the Actions block entirely.
+  const menu = buildStoryMenu(row, packet, classifiedStoryIds, parentIntakeId);
+  if (menu.length > 0) out.push(...renderActionMenu(menu, menuCursor, fg, innerW));
   return out;
 }
 
