@@ -34,7 +34,11 @@ import {
   dispatchPromptFor,
   filterMatrixRows,
   buildIntakeByStory,
+  buildStoryMenu,
+  buildBacklogMenu,
+  referencedDocs,
   type DashboardData,
+  type MenuItem,
   type DashboardNav,
   type DashboardTab,
   type DrillTarget,
@@ -220,14 +224,16 @@ test("dispatchPromptFor: every prompt leads with the AGENTS.md idiom", () => {
     assert.match(p, /^please check @AGENTS\.md, follow the harness flow and/);
   }
 });
-test("US-027: backlog detail renders [s] start hint", () => {
+test("US-043: backlog detail renders an Actions menu with the triage item", () => {
   const text = renderDashboardLines(
     bareState(),
     nav("backlog", 0, { kind: "backlog", index: 0 }),
     dashData({ backlog: [{ id: 5, title: "view-only", status: "proposed", risk: "normal", detail: "" }] }),
     id
   ).join("\n");
-  assert.match(text, /\[s\] start.*#5/);
+  assert.match(text, /Actions:/);
+  assert.match(text, /Start — triage #5/);
+  assert.doesNotMatch(text, /\[s\] start/); // hotkey hint retired — now a menu item
 });
 
 // ─── render: matrix tab ────────────────────────────────────────────────────
@@ -242,7 +248,10 @@ test("renders title, detected-state header, 2-tab strip, footer hints", () => {
   assert.match(text, /2 backlog/);
   assert.doesNotMatch(text, /\bstats\b/);
   assert.doesNotMatch(text, /\btools\b/);
-  assert.match(text, /\[r\] refresh.*\[s\] start.*\[Esc\] close/);
+  assert.match(text, /\[↑↓\/j,k\] move.*\[Enter\] open.*\[r\] refresh.*\[Esc\] close/);
+  assert.match(text, /\[f\] filter/);
+  assert.match(text, /\[f\] cycle.*\[g\] group/); // matches header
+  assert.doesNotMatch(text, /\[s\] start/); // list view decluttered (US-043)
 });
 test("matrix tab lists every story row with status + id", () => {
   const text = renderDashboardLines(bareState(), nav("matrix"), dashData({ matrix: parseMatrixNumeric(FIXTURE_MATRIX) }), id).join("\n");
@@ -330,29 +339,75 @@ test("matrix grouped view: initiative headers + indented stories + no-initiative
   assert.doesNotMatch(flat, /Realign griller\/kicker\/dashboard to upstream/);
 });
 
-// ─── reducer: 'o' openDoc action (US-042) ──────────────────────────────────
 
-console.log("=== dashboard: 'o' openDoc action (US-042) ===");
+console.log("=== dashboard: action menu builders (US-043) ===");
 
-test("reducer: 'o' on matrix signals openDoc (matrix-only; empty-safe)", () => {
-  // matrix with rows → openDoc
-  const a = reduceDashboardNav({ tab: "matrix", cursor: 1, drill: null }, "o", LENS(3, 0));
-  assert.equal(a.action, "openDoc");
-  // empty matrix → nothing to open (no action)
-  const b = reduceDashboardNav({ tab: "matrix", cursor: 0, drill: null }, "o", LENS(0, 0));
-  assert.equal(b.action, undefined);
-  // backlog → no openDoc (stories have packet docs; backlog items do not)
-  const c = reduceDashboardNav({ tab: "backlog", cursor: 0, drill: null }, "o", LENS(0, 3));
-  assert.equal(c.action, undefined);
+test("referencedDocs: extracts decisions/initiatives/product doc paths, de-duped + capped", () => {
+  const md =
+    "see docs/decisions/0014-dashboard-dispatch-policy.md and " +
+    "docs/initiatives/0002-dashboard-focus-rework.md; also docs/product/dashboard.md " +
+    "again docs/decisions/0014-dashboard-dispatch-policy.md and docs/stories/US-027-x.md";
+  const docs = referencedDocs(md);
+  assert.deepEqual(docs, [
+    "docs/decisions/0014-dashboard-dispatch-policy.md",
+    "docs/initiatives/0002-dashboard-focus-rework.md",
+    "docs/product/dashboard.md",
+  ]);
+  assert.ok(!docs.some((d) => d.startsWith("docs/stories/")), "story packets are not 'related docs'");
+  const big = Array.from({ length: 12 }, (_, i) => `docs/decisions/00${i}-x.md`).join(" ");
+  assert.equal(referencedDocs(big, 5).length, 5);
 });
 
-test("reducer: 'o' works from the drilled story detail too", () => {
-  const a = reduceDashboardNav(
-    { tab: "matrix", cursor: 0, drill: { kind: "matrix", index: 0 } },
-    "o",
-    LENS(3, 0)
-  );
-  assert.equal(a.action, "openDoc");
+test("buildStoryMenu: dispatch first; packet item when packet exists; related-doc items", () => {
+  const row = { id: "US-014", title: "x", status: "planned", unit: 0, integ: 0, e2e: 0, plat: 0 };
+  const packet = {
+    filename: "US-014-foo.md",
+    text: "see docs/decisions/0014-dashboard-dispatch-policy.md and docs/initiatives/0002-x.md",
+  };
+  const items: MenuItem[] = buildStoryMenu(row, packet, new Set(["US-014"]), undefined);
+  assert.equal(items[0]!.label, "Start — implement US-014"); // classified
+  assert.equal(items[0]!.action.kind, "dispatch");
+  assert.equal(items[1]!.label, "Open story packet");
+  assert.equal(items[1]!.action.kind, "openDoc");
+  const openItems = items.filter((i) => i.action.kind === "openDoc");
+  assert.ok(openItems.some((i) => i.label === "Open 0014-dashboard-dispatch-policy"));
+  assert.ok(openItems.some((i) => (i.action as { path: string }).path === "docs/initiatives/0002-x.md"));
+  const relatedItems = openItems.filter((i) => i.label !== "Open story packet");
+  assert.ok(!relatedItems.some((i) => (i.action as { path: string }).path.startsWith("docs/stories/US-014")), "own packet excluded from related");
+});
+
+test("buildStoryMenu: unclassified → 'Start — classify'; no packet → dispatch only", () => {
+  const row = { id: "US-099", title: "x", status: "planned", unit: 0, integ: 0, e2e: 0, plat: 0 };
+  const items: MenuItem[] = buildStoryMenu(row, undefined, new Set(), undefined);
+  assert.equal(items.length, 1);
+  assert.equal(items[0]!.label, "Start — classify US-099");
+  assert.equal(items[0]!.action.kind, "dispatch");
+});
+
+test("buildBacklogMenu: a single 'Start — triage #<id>' dispatch item", () => {
+  const items: MenuItem[] = buildBacklogMenu({ id: 7, title: "x", status: "proposed", risk: "tiny", detail: "" });
+  assert.equal(items.length, 1);
+  assert.equal(items[0]!.label, "Start — triage #7");
+  assert.equal(items[0]!.action.kind, "dispatch");
+});
+
+test("reducer: list view has NO `s`/`o` hotkeys (decluttered, US-043)", () => {
+  const onMatrix = { tab: "matrix", cursor: 0, drill: null } as DashboardNav;
+  assert.equal(reduceDashboardNav(onMatrix, "s", LENS(3, 0)).action, undefined);
+  assert.equal(reduceDashboardNav(onMatrix, "o", LENS(3, 0)).action, undefined);
+  const drilled: DashboardNav = { tab: "matrix", cursor: 0, drill: { kind: "matrix", index: 0 } };
+  assert.equal(reduceDashboardNav(drilled, "s", LENS(3, 0, 1)).action, undefined);
+  assert.equal(reduceDashboardNav(drilled, "o", LENS(3, 0, 1)).action, undefined);
+});
+
+test("story detail (drilled): renders an Actions menu + drilled footer hint", () => {
+  const row = { id: "US-014", title: "Drill-down", status: "in_progress", unit: 0, integ: 0, e2e: 0, plat: 0 };
+  const data = dashData({ matrix: [row], packets: { "US-014": PACKET("US-014", "in_progress", "normal", "- ac.", "ev") } });
+  const text = renderDashboardLines(bareState(), nav("matrix", 0, { kind: "matrix", index: 0 }), data, id).join("\n");
+  assert.match(text, /Actions:/);
+  assert.match(text, /Start — classify US-014/);
+  assert.match(text, /Open story packet/);
+  assert.match(text, /\[↑↓\/j,k\] choose.*\[Enter\] select.*\[Esc\] back/);
 });
 
 // ─── render: backlog tab ───────────────────────────────────────────────────
@@ -437,7 +492,7 @@ test("fixHintFor: every kind has a non-empty hint", () => {
 
 console.log("=== dashboard: reduceDashboardNav (pure) ===");
 // rest-args absorbed so legacy multi-arg call shapes stay harmless.
-const LENS = (m: number, b: number, ..._rest: number[]) => ({ matrix: m, backlog: b });
+const LENS = (m: number, b: number, menu?: number) => ({ matrix: m, backlog: b, menu });
 
 test("reducer: ↓/j moves cursor down, clamped to list length-1", () => {
   const start: DashboardNav = { tab: "matrix", cursor: 0, drill: null };
@@ -482,10 +537,17 @@ test("reducer: empty list disables drill + cursor move", () => {
   assert.equal(reduceDashboardNav(start, "\r", LENS(0, 0)).nav.drill, null);
   assert.equal(reduceDashboardNav(start, "j", LENS(0, 0)).nav.cursor, 0);
 });
-test("reducer: drilled state ignores cursor keys + Enter (Esc is the only exit)", () => {
-  const drilled: DashboardNav = { tab: "backlog", cursor: 1, drill: { kind: "backlog", index: 1 } };
-  assert.equal(reduceDashboardNav(drilled, "j", LENS(0, 5)).nav.cursor, 1);
-  assert.equal(reduceDashboardNav(drilled, "\r", LENS(0, 5)).nav.drill?.index, 1);
+test("reducer: drilled state drives the action menu (↑↓ move menuCursor, Enter selects)", () => {
+  const drilled: DashboardNav = { tab: "backlog", cursor: 1, drill: { kind: "backlog", index: 1 }, menuCursor: 0 };
+  // a 1-item backlog menu clamps at 0 on ↓
+  assert.equal(reduceDashboardNav(drilled, "j", LENS(0, 5, 1)).nav.menuCursor, 0);
+  // a 3-item story menu: ↓ → 1; clamp at 2; ↑ → 1
+  const story: DashboardNav = { tab: "matrix", cursor: 0, drill: { kind: "matrix", index: 0 }, menuCursor: 0 };
+  assert.equal(reduceDashboardNav(story, "\x1b[B", LENS(3, 0, 3)).nav.menuCursor, 1);
+  assert.equal(reduceDashboardNav({ ...story, menuCursor: 2 }, "\x1b[B", LENS(3, 0, 3)).nav.menuCursor, 2);
+  assert.equal(reduceDashboardNav({ ...story, menuCursor: 2 }, "k", LENS(3, 0, 3)).nav.menuCursor, 1);
+  // Enter → menuSelect
+  assert.equal(reduceDashboardNav(story, "\r", LENS(3, 0, 3)).action, "menuSelect");
 });
 
 console.log("=== dashboard: detail panes (drill-down) ===");
@@ -661,28 +723,23 @@ test("reducer: tab switch resets matrixFilter to all", () => {
   assert.equal(r.matrixFilter, "all");
 });
 
-// ─── reducer: `s` dispatch signal (US-027) ────────────────────────────────
-test("reducer: `s` on matrix (non-empty) → action dispatch", () => {
-  const st: DashboardNav = { tab: "matrix", cursor: 0, drill: null };
-  assert.equal(reduceDashboardNav(st, "s", LENS(3, 0)).action, "dispatch");
+// ─── reducer: action-menu select + reset (US-043) ─────────────────────────
+test("reducer: drill open / Esc-back / tab-switch all reset menuCursor to 0", () => {
+  // Enter drills and seeds menuCursor at 0 (even if it was non-zero before)
+  const drilled = reduceDashboardNav({ tab: "matrix", cursor: 1, drill: null, menuCursor: 5 }, "\r", LENS(3, 0)).nav;
+  assert.equal(drilled.menuCursor, 0);
+  assert.deepEqual(drilled.drill, { kind: "matrix", index: 1 });
+  // Esc from drill resets menuCursor
+  const back = reduceDashboardNav({ ...drilled, menuCursor: 2 }, "\u001b", LENS(3, 0, 3)).nav;
+  assert.equal(back.drill, null);
+  assert.equal(back.menuCursor, 0);
+  // tab switch resets menuCursor
+  const switched = reduceDashboardNav({ ...drilled, menuCursor: 2 }, "2", LENS(3, 3)).nav;
+  assert.equal(switched.menuCursor, 0);
 });
-test("reducer: `s` on backlog (non-empty) → action dispatch", () => {
-  const st: DashboardNav = { tab: "backlog", cursor: 0, drill: null };
-  assert.equal(reduceDashboardNav(st, "s", LENS(0, 3)).action, "dispatch");
-});
-test("reducer: `s` on empty list → no-op (no dispatch)", () => {
-  const st: DashboardNav = { tab: "backlog", cursor: 0, drill: null };
-  assert.equal(reduceDashboardNav(st, "s", LENS(0, 0)).action, undefined);
-});
-test("reducer: `s` works when drilled (cursor holds the row)", () => {
-  const drilled: DashboardNav = { tab: "backlog", cursor: 1, drill: { kind: "backlog", index: 1 } };
-  assert.equal(reduceDashboardNav(drilled, "s", LENS(0, 3)).action, "dispatch");
-});
-test("reducer: `s` preserves nav (no cursor/filter change)", () => {
-  const st: DashboardNav = { tab: "matrix", cursor: 2, drill: null, matrixFilter: "planned" };
-  const r = reduceDashboardNav(st, "s", LENS(3, 0)).nav;
-  assert.equal(r.cursor, 2);
-  assert.equal(r.matrixFilter, "planned");
+test("reducer: drilled Enter on an empty menu is a no-op (no menuSelect)", () => {
+  const drilled: DashboardNav = { tab: "matrix", cursor: 0, drill: { kind: "matrix", index: 0 } };
+  assert.equal(reduceDashboardNav(drilled, "\r", LENS(3, 0, 0)).action, undefined);
 });
 test("reducer: `r` refresh preserves the active matrixFilter", () => {
   const st: DashboardNav = { tab: "matrix", cursor: 0, drill: null, matrixFilter: "planned" };
@@ -1072,36 +1129,37 @@ test("failing backlog query (exit 1) → backlog tab shows a dim error row, neve
 
 // ─── US-027: dispatch key (in-session sendUserMessage) ────────────────────
 
-console.log("=== dashboard: US-027 dispatch key ===");
-test("US-027 dispatch: `s` on backlog → pi.sendUserMessage with triage prompt", async () => {
+console.log("=== dashboard: US-043 menu dispatch (drill → select) ===");
+test("US-043 dispatch: backlog drill+select → pi.sendUserMessage with triage prompt", async () => {
   const mod = await import("../extensions/harness/index.ts");
   const cwd = installedRepo();
   try {
-    const { pi, ctx, state, registeredCommands } = mockHarness(cwd, { keySeqs: [["2", "s"]] });
+    // '2' → backlog tab, Enter → drill, Enter → select menu item 0 (dispatch)
+    const { pi, ctx, state, registeredCommands } = mockHarness(cwd, { keySeqs: [["2", "\r", "\r"]] });
     mod.default(pi as never);
     await registeredCommands.get("harness")!("", ctx as never);
-    assert.equal(state.sentMessages.length, 1, "dispatch sends exactly one user message");
+    assert.equal(state.sentMessages.length, 1, "menu dispatch sends exactly one user message");
     assert.match(state.sentMessages[0]!, /start with backlog #2/);
     assert.match(state.sentMessages[0]!, /triage/);
   } finally {
     rmSync(cwd, { recursive: true, force: true });
   }
 });
-test("US-027 dispatch: `s` on matrix → classify prompt (unclassified default)", async () => {
+test("US-043 dispatch: matrix drill+select → classify prompt (unclassified default)", async () => {
   const mod = await import("../extensions/harness/index.ts");
   const cwd = installedRepo();
   try {
-    const { pi, ctx, state, registeredCommands } = mockHarness(cwd, { keySeqs: [["s"]] });
+    // Enter → drill matrix row 0, Enter → select menu item 0 (dispatch)
+    const { pi, ctx, state, registeredCommands } = mockHarness(cwd, { keySeqs: [["\r", "\r"]] });
     mod.default(pi as never);
     await registeredCommands.get("harness")!("", ctx as never);
     assert.equal(state.sentMessages.length, 1);
-    // WIRED_MATRIX row 0 = US-001; classifiedStoryIds empty (intakes unmocked) → classify
     assert.match(state.sentMessages[0]!, /classify US-001/);
   } finally {
     rmSync(cwd, { recursive: true, force: true });
   }
 });
-test("US-027 dispatch: Esc (no `s`) → no user message sent", async () => {
+test("US-043 dispatch: Esc (no select) → no user message sent", async () => {
   const mod = await import("../extensions/harness/index.ts");
   const cwd = installedRepo();
   try {

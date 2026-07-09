@@ -396,6 +396,83 @@ export function dispatchPromptFor(
   return `${base} implement ${target.id} against docs/stories/${target.id}-*.md (acceptance criteria).`;
 }
 
+// ─── detail action menu (US-043) ───────────────────────────────────────────
+
+/** One selectable action in the drilled detail menu (US-043). `dispatch`
+ *  hands the focused row to the agent (start/classify/implement/triage);
+ *  `openDoc` opens a doc path in a cmux side surface. */
+export type MenuAction =
+  | { kind: "dispatch" }
+  | { kind: "openDoc"; path: string };
+
+/** A navigable menu item: a label + the action running it triggers. */
+export interface MenuItem {
+  label: string;
+  action: MenuAction;
+}
+
+/**
+ * Pure: doc paths referenced inside a packet's markdown — `docs/decisions/*`,
+ * `docs/initiatives/*`, `docs/product/*` (the docs related to a story). These
+ * become `Open <basename>` items in the detail menu so the operator can open
+ * related decisions / initiative notes / product docs, not only the story
+ * packet. De-duped, order-preserving, capped. Pure + total: never throws.
+ */
+export function referencedDocs(packetText: string, max = 8): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const m of packetText.matchAll(/docs\/(?:decisions|initiatives|product)\/[A-Za-z0-9._/-]+\.md/g)) {
+    const p = m[0]!;
+    if (seen.has(p)) continue;
+    seen.add(p);
+    out.push(p);
+    if (out.length >= max) break;
+  }
+  return out;
+}
+
+/**
+ * Pure: build the navigable action menu for a drilled STORY (US-043). In
+ * order: (1) Start (implement if classified, else classify); (2) `Open story
+ * packet` when a packet exists; (3) one `Open <basename>` per related doc in
+ * the packet (decisions / initiative notes / product docs), excluding the
+ * packet's own path, capped at 6. `parentIntakeId` is accepted for symmetry —
+ * initiative notes are already surfaced via `referencedDocs` (packets link
+ * them), so it is intentionally unused here.
+ */
+export function buildStoryMenu(
+  row: MatrixRow,
+  packet: PacketRef | undefined,
+  classifiedStoryIds: ReadonlySet<string>,
+  _parentIntakeId: number | undefined
+): MenuItem[] {
+  const items: MenuItem[] = [];
+  const act = nextActionFor(row, classifiedStoryIds);
+  items.push({
+    label: act.next === "implement" ? `Start — implement ${row.id}` : `Start — classify ${row.id}`,
+    action: { kind: "dispatch" },
+  });
+  if (packet) {
+    const ownPath = `docs/stories/${packet.filename}`;
+    items.push({ label: "Open story packet", action: { kind: "openDoc", path: ownPath } });
+    let related = 0;
+    for (const p of referencedDocs(packet.text)) {
+      if (p === ownPath) continue;
+      const base = (p.split("/").pop() ?? p).replace(/\.md$/i, "");
+      items.push({ label: `Open ${base}`, action: { kind: "openDoc", path: p } });
+      related++;
+      if (related >= 6) break;
+    }
+  }
+  return items;
+}
+
+/** Pure: build the action menu for a drilled BACKLOG item (US-043) — a single
+ *  Start item that hands the item to the agent for triage. */
+export function buildBacklogMenu(row: BacklogRow): MenuItem[] {
+  return [{ label: `Start — triage #${row.id}`, action: { kind: "dispatch" } }];
+}
+
 // ─── matrix status-filter (US-026) ─────────────────────────────────────────
 
 /** Matrix status-filter stops (US-026). `f` cycles through these in order. */
@@ -447,15 +524,19 @@ export interface DashboardNav {
   /** US-041: group matrix rows under initiative headers (matrix tab only;
    *  resets to false on tab switch). Optional so existing literals stay valid. */
   groupByInitiative?: boolean;
+  /** US-043: 0-based cursor within the drilled detail action menu (resets to 0
+   *  on drill open / tab switch / Esc-back). Optional so existing literals
+   *  stay valid. */
+  menuCursor?: number;
 }
 
-/** Result of reducing one key: new nav + optional action. `dispatch` (US-027)
- *  signals that the operator pressed `s` on a dispatchable list row; the
- *  component builds the prompt from the selected row + calls onDone (the
- *  reducer has no row data, so it only signals). */
+/** Result of reducing one key: new nav + optional action. `menuSelect` (US-043)
+ *  signals that the operator pressed Enter on the drilled action menu; the
+ *  component resolves the selected `MenuItem` → dispatch/openDoc (the reducer
+ *  has no row data, so it only signals). */
 export interface DashboardNavResult {
   nav: DashboardNav;
-  action?: "close" | "refresh" | "dispatch" | "openDoc";
+  action?: "close" | "refresh" | "menuSelect";
 }
 
 /** Hotkey → tab. Shared by the reducer + the component. */
@@ -502,60 +583,67 @@ function extractSection(text: string, heading: string): string {
 }
 
 /**
- * Pure dashboard key→nav reducer (US-014). The component's `handleInput` is a
- * thin shell over this, so the full key model is unit-testable without pi.
+ * Pure dashboard key→nav reducer (US-014, reworked US-043). The component's
+ * `handleInput` is a thin shell over this, so the full key model is unit-
+ * testable without pi.
  *
- * - Esc: pop drill if drilled, else close.
- * - `r`: refresh. `1`/`2`: switch tab (resets cursor + drill).
- * - ↑/`k`, ↓/`j`: move cursor on a list tab (clamped; no-op when drilled, on a
- *   non-list tab, or the list is empty).
- * - Enter: drill into the selected row of a list tab (no-op when drilled, on a
- *   non-list tab, or the list is empty).
+ * - Esc: drilled → back to list (reset menuCursor); else close.
+ * - `r`: refresh. `1`/`2`: switch tab (resets cursor + drill + menuCursor).
+ * - List (non-drilled): ↑/`k`, ↓/`j` move the row cursor; `Enter` drills into
+ *   the selected row; `f`/`g` are matrix view toggles. `s`/`o` are NO-OPS here
+ *   — start/open-doc are menu items in the detail view only (US-043).
+ * - Drilled (detail): ↑/`k`, ↓/`j` move the ACTION-MENU cursor; `Enter`
+ *   signals `menuSelect` (the component resolves the selected item).
  *
- * `lens` is the current row count per list tab (the component supplies live
- * lengths so the reducer can clamp/disable without owning the data).
+ * `lens` is the current row count per list tab + the drilled menu length
+ * (`menu`); the component supplies live lengths so the reducer can clamp /
+ * disable without owning the data.
  */
 export function reduceDashboardNav(
   nav: DashboardNav,
   key: string,
-  lens: { matrix: number; backlog: number }
+  lens: { matrix: number; backlog: number; menu?: number }
 ): DashboardNavResult {
+  // Esc: drilled → back to list (reset menuCursor); else close.
   if (isEscape(key)) {
-    return nav.drill ? { nav: { ...nav, drill: null } } : { nav, action: "close" };
+    return nav.drill ? { nav: { ...nav, drill: null, menuCursor: 0 } } : { nav, action: "close" };
   }
   if (key === "r") return { nav, action: "refresh" };
+  // tab switch: 1/2 (resets cursor + drill + menuCursor + filter + group)
   const t = TAB_KEYS[key];
-  if (t) return { nav: { tab: t, cursor: 0, drill: null, matrixFilter: "all", groupByInitiative: false } };
-  // US-027: `s` dispatches the selected row to the agent in-session
-  // (pi.sendUserMessage). Fires on matrix + backlog — the dispatchable list
-  // tabs — in both list and drilled states (the cursor holds the row either
-  // way). The reducer only signals `dispatch`; the component owns the
-  // selected-row → prompt build (it has the data, the reducer does not).
-  if (key === "s" && (nav.tab === "matrix" || nav.tab === "backlog")) {
-    const len = lens[nav.tab] ?? 0;
-    return len > 0 ? { nav, action: "dispatch" } : { nav };
+  if (t) return { nav: { tab: t, cursor: 0, drill: null, menuCursor: 0, matrixFilter: "all", groupByInitiative: false } };
+
+  // US-043: drilled (detail view) — the list keys now drive the ACTION MENU
+  // (↑/↓ move menuCursor, Enter selects). `s`/`o` are gone from the list; the
+  // only way to start / open-doc is to drill, then pick a menu item.
+  if (nav.drill) {
+    const menuLen = lens.menu ?? 0;
+    if (isArrowUp(key) || key === "k") {
+      if (menuLen === 0) return { nav };
+      return { nav: { ...nav, menuCursor: clamp((nav.menuCursor ?? 0) - 1, 0, menuLen - 1) } };
+    }
+    if (isArrowDown(key) || key === "j") {
+      if (menuLen === 0) return { nav };
+      return { nav: { ...nav, menuCursor: clamp((nav.menuCursor ?? 0) + 1, 0, menuLen - 1) } };
+    }
+    if (isEnter(key)) {
+      if (menuLen === 0) return { nav };
+      return { nav, action: "menuSelect" };
+    }
+    return { nav };
   }
-  // US-042: `o` opens the focused story's packet doc in a cmux side surface
-  //  (matrix-only — stories have packets; backlog items do not). Fires in both
-  //  list and drilled states (the cursor holds the story either way). The
-  //  reducer only signals `openDoc`; the component resolves the doc path.
-  if (key === "o" && nav.tab === "matrix") {
-    const len = lens.matrix ?? 0;
-    return len > 0 ? { nav, action: "openDoc" } : { nav };
-  }
-  // cursor / drill only apply to list tabs, and only when not already drilled
-  if (nav.drill || !isListTab(nav.tab)) return { nav };
-  // US-026: `f` cycles the matrix status-filter (matrix-only; no-op on other
-  // list tabs). Resets cursor to 0 — the list content changes, so position is
-  // meaningless (mirrors the tab-switch cursor reset).
+
+  // list view (non-drilled) — navigation + view toggles only (no `s`/`o`).
+  if (!isListTab(nav.tab)) return { nav };
+  // US-026: `f` cycles the matrix status-filter (matrix list only). Resets
+  // cursor — the list content changes, so position is meaningless.
   if (key === "f" && nav.tab === "matrix") {
     const cur = nav.matrixFilter ?? "all";
     const next = MATRIX_FILTER_CYCLE[(MATRIX_FILTER_CYCLE.indexOf(cur) + 1) % MATRIX_FILTER_CYCLE.length]!;
     return { nav: { ...nav, matrixFilter: next, cursor: 0 } };
   }
-  // US-041: `g` toggles group-by-initiative on the matrix tab (matrix-only;
-  //  no-op when drilled or on other tabs). Resets cursor — the layout changes.
-  if (key === "g" && nav.tab === "matrix" && !nav.drill) {
+  // US-041: `g` toggles group-by-initiative (matrix list only). Resets cursor.
+  if (key === "g" && nav.tab === "matrix") {
     return { nav: { ...nav, groupByInitiative: !(nav.groupByInitiative ?? false), cursor: 0 } };
   }
   const len = lens[nav.tab] ?? 0;
@@ -569,7 +657,7 @@ export function reduceDashboardNav(
   }
   if (isEnter(key)) {
     if (len === 0) return { nav };
-    return { nav: { ...nav, drill: { kind: nav.tab, index: nav.cursor } } };
+    return { nav: { ...nav, menuCursor: 0, drill: { kind: nav.tab, index: nav.cursor } } };
   }
   return { nav };
 }
@@ -633,7 +721,7 @@ export function renderDashboardLines(
   const filteredMatrix = filterMatrixRows(data.matrix, data.classifiedStoryIds, matrixFilter);
   if (nav.drill) {
     const drillData = nav.drill.kind === "matrix" ? { ...data, matrix: filteredMatrix } : data;
-    content.push(...renderDetail(nav.drill, drillData, fg, innerW));
+    content.push(...renderDetail(nav.drill, drillData, fg, innerW, nav.menuCursor ?? 0));
   } else if (nav.tab === "matrix") {
     // US-041: initiative linkage for the matrix badge + group-by view.
     const intakeByStory = buildIntakeByStory(data.initiatives);
@@ -650,18 +738,16 @@ export function renderDashboardLines(
   }
   content.push("");
 
-  // ── footer hints (context-sensitive: drilled vs list; [s] on dispatchable tabs) ──
+  // ── footer hints (context-sensitive: drilled = action menu; list = nav) ──
   // `[1,2] tabs` is omitted — the tab strip above already labels each tab with
-  // its hotkey.
-  const dispatchable = nav.tab === "matrix" || nav.tab === "backlog";
+  // its hotkey. US-043: `s`/`o` no longer appear — start/open-doc are menu
+  // items in the detail view only.
   content.push(
     dim(
       nav.drill
-        ? dispatchable
-          ? "[Esc] back · [s] start"
-          : "[Esc] back to list"
+        ? "[↑↓/j,k] choose · [Enter] select · [Esc] back"
         : "[↑↓/j,k] move · [Enter] open · [r] refresh" +
-          (dispatchable ? " · [s] start" : "") +
+          (nav.tab === "matrix" ? " · [f] filter" : "") +
           " · [Esc] close"
     )
   );
@@ -881,6 +967,18 @@ function sectionLines(body: string, n: number, width: number, fg: FgFn): string[
     .map((l) => dim("  " + truncateAnsi(l, width)));
 }
 
+/** US-043: render the navigable action menu for a drilled row. Each item is
+ *  prefixed with the `▸ `/`  ` selection marker; the active item is
+ *  `menuCursor`. Pure. */
+function renderActionMenu(items: MenuItem[], menuCursor: number, fg: FgFn, innerW: number): string[] {
+  const dim = (t: string) => fg("dim", t);
+  const out: string[] = [dim("Actions:")];
+  items.forEach((it, i) => {
+    out.push(rowMarker(i === menuCursor) + truncateAnsi(it.label, innerW - MARK_W));
+  });
+  return out;
+}
+
 /** Render the drilled STORY detail: packet-derived status/lane + classified/next
  *  routing (US-023, reworked US-036) + the initiative link + Acceptance +
  *  Evidence excerpts + the packet path. Pure. */
@@ -891,7 +989,8 @@ function renderStoryDetail(
   provenance: StoryProvenance | undefined,
   fg: FgFn,
   innerW: number,
-  parentIntakeId: number | undefined = undefined
+  parentIntakeId: number | undefined = undefined,
+  menuCursor: number = 0
 ): string[] {
   const dim = (t: string) => fg("dim", t);
   const out: string[] = [];
@@ -914,7 +1013,6 @@ function renderStoryDetail(
       `${dim("next:")} ${action.next === "implement" ? fg("accent", "implement") : fg("warning", "classify")}`
   );
   out.push(dim("→ " + truncateAnsi(action.prompt, innerW - 2)));
-  out.push(dim(`[s] start — ${action.next === "classify" ? "classify" : "implement"} ${row.id} now`));
   // US-025: Provenance lane — Tier 2 evidence for THIS story (read-only). Shown
   // for every story (independent of packet presence): intake linkage + traces.
   out.push(dim("Provenance:"));
@@ -934,22 +1032,25 @@ function renderStoryDetail(
   );
   if (!packet) {
     out.push(dim(`(no packet file — orphan durable; add docs/stories/${row.id}-*.md)`));
-    return out;
+  } else {
+    out.push(dim("Packet: " + truncateAnsi(packet.filename, innerW - 8)));
+    const ac = extractSection(packet.text, "Acceptance Criteria");
+    if (ac) {
+      out.push(dim("Acceptance:"));
+      out.push(...sectionLines(ac, 3, innerW - 2, fg));
+    }
+    const ev = extractSection(packet.text, "Evidence");
+    out.push(dim("Evidence:"));
+    out.push(...(ev ? sectionLines(ev, 2, innerW - 2, fg) : [dim("  (empty — not yet recorded)")]));
   }
-  out.push(dim("Packet: " + truncateAnsi(packet.filename, innerW - 8)));
-  const ac = extractSection(packet.text, "Acceptance Criteria");
-  if (ac) {
-    out.push(dim("Acceptance:"));
-    out.push(...sectionLines(ac, 3, innerW - 2, fg));
-  }
-  const ev = extractSection(packet.text, "Evidence");
-  out.push(dim("Evidence:"));
-  out.push(...(ev ? sectionLines(ev, 2, innerW - 2, fg) : [dim("  (empty — not yet recorded)")]));
+  // US-043: navigable action menu — the only way to start / open a doc. Always
+  // rendered (an orphan can still be classified); the marker tracks menuCursor.
+  out.push(...renderActionMenu(buildStoryMenu(row, packet, classifiedStoryIds, parentIntakeId), menuCursor, fg, innerW));
   return out;
 }
 
 /** Render the drilled BACKLOG detail: full fields + the detail tail. Pure. */
-function renderBacklogDetail(row: BacklogRow, fg: FgFn, innerW: number): string[] {
+function renderBacklogDetail(row: BacklogRow, fg: FgFn, innerW: number, menuCursor: number = 0): string[] {
   const dim = (t: string) => fg("dim", t);
   const out: string[] = [];
   out.push(`${fg("accent", "#" + row.id)}  ${truncateAnsi(row.title, innerW - String(row.id).length - 3)}`);
@@ -962,7 +1063,8 @@ function renderBacklogDetail(row: BacklogRow, fg: FgFn, innerW: number): string[
   } else {
     out.push(dim("Detail: (none recorded)"));
   }
-  out.push(dim(`[s] start — hand #${row.id} to the agent to triage (close / promote / reframe)`));
+  // US-043: navigable action menu (triage) — the marker tracks menuCursor.
+  out.push(...renderActionMenu(buildBacklogMenu(row), menuCursor, fg, innerW));
   return out;
 }
 
@@ -986,17 +1088,18 @@ function renderDetail(
   drill: DrillTarget,
   data: DashboardData,
   fg: FgFn,
-  innerW: number
+  innerW: number,
+  menuCursor: number
 ): string[] {
   if (drill.kind === "matrix") {
     const row = data.matrix[drill.index];
     if (!row) return [fg("dim", "(row no longer exists — press r to refresh)")];
-    return renderStoryDetail(row, data.packets[row.id], data.classifiedStoryIds, data.provenance.get(row.id), fg, innerW, findParentIntake(data.initiatives, row.id));
+    return renderStoryDetail(row, data.packets[row.id], data.classifiedStoryIds, data.provenance.get(row.id), fg, innerW, findParentIntake(data.initiatives, row.id), menuCursor);
   }
   // backlog
   const row = data.backlog[drill.index];
   if (!row) return [fg("dim", "(row no longer exists — press r to refresh)")];
-  return renderBacklogDetail(row, fg, innerW);
+  return renderBacklogDetail(row, fg, innerW, menuCursor);
 }
 
 /** A single proof mark: ✓ (success) for 1, · (dim) for 0. */

@@ -69,8 +69,13 @@ import {
   renderDashboardLines,
   filterMatrixRows,
   dispatchPromptFor,
+  buildStoryMenu,
+  buildBacklogMenu,
+  buildIntakeByStory,
   type DashboardData,
   type DispatchTarget,
+  type DrillTarget,
+  type MenuItem,
   type DashboardNav,
   type DashboardTab,
   type MatrixRow,
@@ -357,19 +362,49 @@ class HarnessOverlayComponent {
       else if (key === "d") this.flags = { ...this.flags, initDb: !this.flags.initDb };
       return;
     }
-    // DASHBOARD — delegate the full key model to the pure reducer (US-014)
+    // DASHBOARD — delegate the full key model to the pure reducer (US-014).
     // US-026: lens.matrix is the FILTERED length so cursor/drill clamp to the
-    // visible list, not the full matrix. Computed from the current filter.
+    // visible list. US-043: lens.menu is the drilled action-menu length so the
+    // menuCursor clamps to the items actually rendered for this row.
+    const menu = this.menuItemsFor(this.nav.drill);
     const filteredMatrix = filterMatrixRows(this.data.matrix, this.data.classifiedStoryIds, this.nav.matrixFilter);
     const lens = {
       matrix: filteredMatrix.length,
       backlog: this.data.backlog.length,
+      menu: this.nav.drill ? menu.length : 0,
     };
     const res = reduceDashboardNav(this.nav, key, lens);
     this.nav = res.nav;
     if (res.action === "close") this.onDone({ action: "close" });
     else if (res.action === "refresh") this.onDone({ action: "refresh" });
-    else if (res.action === "dispatch") {
+    else if (res.action === "menuSelect") {
+      // US-043: the operator pressed Enter on the action menu. Resolve the
+      // focused item → dispatch (start) or openDoc.
+      const item = menu[this.nav.menuCursor ?? 0];
+      if (item) this.runMenuAction(item);
+    }
+  }
+
+  /** US-043: build the navigable action menu for the current drill target
+   *  (empty when not drilled, or the drilled row no longer exists). */
+  private menuItemsFor(drill: DrillTarget | null): MenuItem[] {
+    if (!drill) return [];
+    if (drill.kind === "matrix") {
+      const filtered = filterMatrixRows(this.data.matrix, this.data.classifiedStoryIds, this.nav.matrixFilter);
+      const row = filtered[drill.index];
+      if (!row) return [];
+      const packet = this.data.packets[row.id];
+      const parent = buildIntakeByStory(this.data.initiatives).get(row.id);
+      return buildStoryMenu(row, packet, this.data.classifiedStoryIds, parent);
+    }
+    const row = this.data.backlog[drill.index];
+    return row ? buildBacklogMenu(row) : [];
+  }
+
+  /** US-043: run one resolved menu item — dispatch reuses the dispatchTarget
+   *  + prompt build; openDoc carries the item's doc path. */
+  private runMenuAction(item: MenuItem): void {
+    if (item.action.kind === "dispatch") {
       const target = this.dispatchTarget();
       if (target) {
         this.onDone({
@@ -379,20 +414,17 @@ class HarnessOverlayComponent {
           tab: this.nav.tab,
         });
       }
-    }
-    else if (res.action === "openDoc") {
-      // US-042: open the focused story packet in a cmux side surface. The
-      // reducer signals; this resolves the selected story → its packet path.
-      const path = this.openDocPath();
-      if (path) this.onDone({ action: "openDoc", path });
+    } else {
+      this.onDone({ action: "openDoc", path: item.action.path });
     }
   }
 
-  /** Resolve the selected row of a dispatchable tab to a DispatchTarget.
-   *  Returns null only if the list is empty (the reducer guards `len > 0`
-   *  before signaling dispatch, so this is defensive). */
+  /** Resolve the focused/drilled row to a DispatchTarget. When drilled the
+   *  menu item's dispatch path targets the drilled row (drill.index); on the
+   *  list it targets the cursor row. Defensive only — the reducer guards
+   *  `len > 0` before the menu can reach dispatch. */
   private dispatchTarget(): DispatchTarget | null {
-    const i = this.nav.cursor;
+    const i = this.nav.drill ? this.nav.drill.index : this.nav.cursor;
     if (this.nav.tab === "backlog") {
       const row = this.data.backlog[i];
       return row ? { kind: "backlog", id: String(row.id), title: row.title } : null;
@@ -407,18 +439,6 @@ class HarnessOverlayComponent {
       return row ? { kind: "matrix", id: row.id, title: row.title } : null;
     }
     return null;
-  }
-
-  /** US-042: resolve the focused story's packet to a repo-relative doc path
-   *  ("docs/stories/US-NNN-*.md"), or null (no packet — e.g. a planned story
-   *  with no packet yet, or a non-matrix tab). The handler joins ctx.cwd. */
-  private openDocPath(): string | null {
-    if (this.nav.tab !== "matrix") return null;
-    const filtered = filterMatrixRows(this.data.matrix, this.data.classifiedStoryIds, this.nav.matrixFilter);
-    const row = filtered[this.nav.cursor];
-    if (!row) return null;
-    const packet = this.data.packets[row.id];
-    return packet ? `docs/stories/${packet.filename}` : null;
   }
 
   render(width: number): string[] {
