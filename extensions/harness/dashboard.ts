@@ -444,6 +444,9 @@ export interface DashboardNav {
   /** US-026: matrix status-filter stop (matrix tab only; resets to "all" on
    *  tab switch). Optional so existing `DashboardNav` literals stay valid. */
   matrixFilter?: MatrixFilter;
+  /** US-041: group matrix rows under initiative headers (matrix tab only;
+   *  resets to false on tab switch). Optional so existing literals stay valid. */
+  groupByInitiative?: boolean;
 }
 
 /** Result of reducing one key: new nav + optional action. `dispatch` (US-027)
@@ -522,7 +525,7 @@ export function reduceDashboardNav(
   }
   if (key === "r") return { nav, action: "refresh" };
   const t = TAB_KEYS[key];
-  if (t) return { nav: { tab: t, cursor: 0, drill: null, matrixFilter: "all" } };
+  if (t) return { nav: { tab: t, cursor: 0, drill: null, matrixFilter: "all", groupByInitiative: false } };
   // US-027: `s` dispatches the selected row to the agent in-session
   // (pi.sendUserMessage). Fires on matrix + backlog — the dispatchable list
   // tabs — in both list and drilled states (the cursor holds the row either
@@ -541,6 +544,11 @@ export function reduceDashboardNav(
     const cur = nav.matrixFilter ?? "all";
     const next = MATRIX_FILTER_CYCLE[(MATRIX_FILTER_CYCLE.indexOf(cur) + 1) % MATRIX_FILTER_CYCLE.length]!;
     return { nav: { ...nav, matrixFilter: next, cursor: 0 } };
+  }
+  // US-041: `g` toggles group-by-initiative on the matrix tab (matrix-only;
+  //  no-op when drilled or on other tabs). Resets cursor — the layout changes.
+  if (key === "g" && nav.tab === "matrix" && !nav.drill) {
+    return { nav: { ...nav, groupByInitiative: !(nav.groupByInitiative ?? false), cursor: 0 } };
   }
   const len = lens[nav.tab] ?? 0;
   if (isArrowUp(key) || key === "k") {
@@ -619,7 +627,16 @@ export function renderDashboardLines(
     const drillData = nav.drill.kind === "matrix" ? { ...data, matrix: filteredMatrix } : data;
     content.push(...renderDetail(nav.drill, drillData, fg, innerW));
   } else if (nav.tab === "matrix") {
-    content.push(...renderMatrixTab(filteredMatrix, data.classifiedStoryIds, matrixFilter, nav.cursor, fg, innerW));
+    // US-041: initiative linkage for the matrix badge + group-by view.
+    const intakeByStory = buildIntakeByStory(data.initiatives);
+    if (nav.groupByInitiative ?? false) {
+      const summaryByIntake = new Map<number, string>(data.initiatives.map((g): [number, string] => [g.intakeId, g.summary]));
+      content.push(
+        ...renderMatrixGrouped(filteredMatrix, data.classifiedStoryIds, matrixFilter, intakeByStory, summaryByIntake, nav.cursor, fg, innerW)
+      );
+    } else {
+      content.push(...renderMatrixTab(filteredMatrix, data.classifiedStoryIds, matrixFilter, nav.cursor, fg, innerW, intakeByStory));
+    }
   } else {
     content.push(...renderBacklogTab(data, nav.cursor, fg, innerW));
   }
@@ -653,32 +670,35 @@ function renderMatrixTab(
   filter: MatrixFilter,
   cursor: number,
   fg: FgFn,
-  innerW: number
+  innerW: number,
+  intakeByStory: Map<string, number>
 ): string[] {
   const dim = (t: string) => fg("dim", t);
   const out: string[] = [];
   const innerW2 = innerW - MARK_W;
 
-  // US-026: active-filter label + `f` discovery, always shown on the matrix
-  // list (the footer can't host `[f]` without overflowing at narrow widths).
+  // US-026: active-filter label + `f` discovery; US-041: `g` group toggle.
   out.push(
     rowMarker(false) +
       dim("filter:") + " " +
       (filter === "all" ? dim(filter) : fg("accent", filter)) +
-      dim("   [f] cycle")
+      dim("   [f] cycle   [g] group")
   );
 
   const BADGE_W = 2; // classified-badge glyph (●/○) + trailing space
   const idW = 7;
+  const initW = 4; // initiative badge "#NN" (US-041); "–" when unlinked
   const statusW = 12;
   const proofW = 7; // "✓ ✓ ✓ ✓" / "u i e p" — 4 marks joined by single spaces
   const gap = 2;
-  const titleW = Math.max(10, innerW2 - (BADGE_W + idW + statusW + proofW + 3 * gap));
+  const titleW = Math.max(10, innerW2 - (BADGE_W + idW + initW + statusW + proofW + 4 * gap));
 
   // column header (indented to align with the marker column)
   const head =
     padRight(dim("c"), BADGE_W - 1) + " " +
     padRight(dim("id"), idW) +
+    gapSpaces(gap) +
+    padRight(dim("init"), initW) +
     gapSpaces(gap) +
     padRight(dim("title"), titleW) +
     gapSpaces(gap) +
@@ -700,12 +720,92 @@ function renderMatrixTab(
     const action = nextActionFor(r, classifiedStoryIds);
     const badge = (action.classified ? fg("success", "●") : fg("dim", "○")) + " ";
     const id = padRight(r.id, idW);
+    const iid = intakeByStory.get(r.id);
+    const init = padRight(iid ? fg("accent", "#" + iid) : dim("–"), initW);
     const title = padRight(truncateAnsi(r.title, titleW), titleW);
     const status = padRight(fg(statusColor(r.status), r.status), statusW);
     const proof =
       proofMark(r.unit, fg) + " " + proofMark(r.integ, fg) + " " + proofMark(r.e2e, fg) + " " + proofMark(r.plat, fg);
-    out.push(rowMarker(i === cursor) + badge + id + gapSpaces(gap) + title + gapSpaces(gap) + status + gapSpaces(gap) + proof);
+    out.push(rowMarker(i === cursor) + badge + id + gapSpaces(gap) + init + gapSpaces(gap) + title + gapSpaces(gap) + status + gapSpaces(gap) + proof);
   });
+  return out;
+}
+
+/** US-041: group-by-initiative matrix view. Stories bucket under their
+ *  initiative header (#NN summary, newest first); stories with no initiative
+ *  fall into a trailing `(no initiative)` bucket. Headers are non-selectable;
+ *  the cursor indexes the flat story list (every story consumes an index,
+ *  headers do not). Per-row formatting mirrors renderMatrixTab minus the init
+ *  column (the header already states the initiative). */
+function renderMatrixGrouped(
+  matrix: MatrixRow[],
+  classifiedStoryIds: ReadonlySet<string>,
+  filter: MatrixFilter,
+  intakeByStory: Map<string, number>,
+  summaryByIntake: Map<number, string>,
+  cursor: number,
+  fg: FgFn,
+  innerW: number
+): string[] {
+  const dim = (t: string) => fg("dim", t);
+  const out: string[] = [];
+  const innerW2 = innerW - MARK_W;
+
+  out.push(
+    rowMarker(false) +
+      dim("filter:") + " " +
+      (filter === "all" ? dim(filter) : fg("accent", filter)) +
+      dim("   [f] cycle   [g] flat")
+  );
+
+  if (matrix.length === 0) {
+    let emptyMsg = "(no stories — query matrix returned nothing)";
+    if (filter === "unclassified") emptyMsg = "(no unclassified stories — classify queue empty)";
+    else if (filter === "planned") emptyMsg = "(no planned stories)";
+    else if (filter === "done") emptyMsg = "(no implemented stories)";
+    out.push(rowMarker(false) + dim(emptyMsg));
+    return out;
+  }
+
+  // bucket rows by initiative (intakeId); unlinked rows → bucket 0 (sorted last)
+  const buckets = new Map<number, MatrixRow[]>();
+  for (const r of matrix) {
+    const iid = intakeByStory.get(r.id) ?? 0;
+    const b = buckets.get(iid);
+    if (b) b.push(r);
+    else buckets.set(iid, [r]);
+  }
+  const ids = [...buckets.keys()].sort((a, b) => (a === 0 ? 1 : b === 0 ? -1 : b - a));
+
+  const BADGE_W = 2;
+  const idW = 7;
+  const statusW = 12;
+  const proofW = 7;
+  const indent = "  ";
+  const gap = 2;
+  const titleW = Math.max(10, innerW2 - (indent.length + BADGE_W + idW + statusW + proofW + 3 * gap));
+
+  let flat = 0;
+  for (const iid of ids) {
+    const rows = buckets.get(iid)!;
+    if (iid === 0) {
+      out.push(rowMarker(false) + dim("(no initiative)"));
+    } else {
+      const headW = innerW2 - String(iid).length - 3;
+      out.push(rowMarker(false) + fg("accent", "#" + iid) + "  " + dim(truncateAnsi(summaryByIntake.get(iid) ?? "", Math.max(8, headW))));
+    }
+    for (const r of rows) {
+      const action = nextActionFor(r, classifiedStoryIds);
+      const badge = (action.classified ? fg("success", "●") : fg("dim", "○")) + " ";
+      const id = padRight(r.id, idW);
+      const title = padRight(truncateAnsi(r.title, titleW), titleW);
+      const status = padRight(fg(statusColor(r.status), r.status), statusW);
+      const proof =
+        proofMark(r.unit, fg) + " " + proofMark(r.integ, fg) + " " + proofMark(r.e2e, fg) + " " + proofMark(r.plat, fg);
+      out.push(rowMarker(flat === cursor) + dim(indent) + badge + id + gapSpaces(gap) + title + gapSpaces(gap) + status + gapSpaces(gap) + proof);
+      flat++;
+    }
+  }
   return out;
 }
 
@@ -862,6 +962,15 @@ function renderBacklogDetail(row: BacklogRow, fg: FgFn, innerW: number): string[
 function findParentIntake(groups: readonly InitiativeGroup[], storyId: string): number | undefined {
   for (const g of groups) if (g.slices.some((s) => s.id === storyId)) return g.intakeId;
   return undefined;
+}
+
+/** US-041: map every slice id → its parent intake id, for the matrix initiative
+ *  badge + group-by view. A story in no initiative is simply absent. Exported
+ *  for unit tests. */
+export function buildIntakeByStory(groups: readonly InitiativeGroup[]): Map<string, number> {
+  const m = new Map<string, number>();
+  for (const g of groups) for (const s of g.slices) m.set(s.id, g.intakeId);
+  return m;
 }
 
 /** Dispatch a drilled target to its detail renderer (bounds-checked). */

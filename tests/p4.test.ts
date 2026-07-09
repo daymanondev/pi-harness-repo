@@ -33,6 +33,7 @@ import {
   nextActionFor,
   dispatchPromptFor,
   filterMatrixRows,
+  buildIntakeByStory,
   type DashboardData,
   type DashboardNav,
   type DashboardTab,
@@ -256,6 +257,77 @@ test("matrix tab lists every story row with status + id", () => {
 test("empty matrix → dim empty-state row (no throw)", () => {
   const text = renderDashboardLines(bareState(), nav("matrix"), dashData(), id).join("\n");
   assert.match(text, /no stories/);
+});
+
+// ─── render: matrix initiative badge + group-by (US-041) ───────────────────
+
+console.log("=== dashboard: matrix initiative badge + group-by (US-041) ===");
+
+const INIT_INTAKES = "44|Realign griller/kicker/dashboard to upstream\n56|Dashboard focus rework\n";
+const INIT_SLICES = "44|US-001|Auth login|implemented\n44|US-002|Manager roles|planned\n56|US-040|Dashboard declutter|implemented\n";
+
+test("buildIntakeByStory: maps slice ids → parent intake id; unlinked absent", () => {
+  const m = buildIntakeByStory(parseInitiatives(INIT_INTAKES, INIT_SLICES));
+  assert.equal(m.get("US-001"), 44);
+  assert.equal(m.get("US-002"), 44);
+  assert.equal(m.get("US-040"), 56);
+  assert.equal(m.get("US-003"), undefined); // not in any initiative
+});
+
+test("matrix flat view: linked row shows #NN initiative badge; unlinked shows –", () => {
+  const data = dashData({
+    matrix: parseMatrixNumeric(FIXTURE_MATRIX),
+    initiatives: parseInitiatives(INIT_INTAKES, INIT_SLICES),
+  });
+  const text = renderDashboardLines(bareState(), nav("matrix"), data, id).join("\n");
+  assert.match(text, /init/); // new column header
+  assert.match(text, /\[g\] group/); // toggle discovery
+  assert.match(text, /US-001.*#44/); // linked row carries its initiative badge
+  assert.match(text, /US-003.*–/); // unlinked row shows the dash
+});
+
+test("reducer: 'g' toggles groupByInitiative on matrix + resets cursor", () => {
+  const on = reduceDashboardNav({ tab: "matrix", cursor: 2, drill: null }, "g", LENS(3, 0)).nav;
+  assert.equal(on.groupByInitiative, true);
+  assert.equal(on.cursor, 0);
+  const off = reduceDashboardNav({ ...on }, "g", LENS(3, 0)).nav;
+  assert.equal(off.groupByInitiative, false);
+});
+
+test("reducer: 'g' no-op on backlog + when drilled; tab switch resets it", () => {
+  const backlog = reduceDashboardNav({ tab: "backlog", cursor: 0, drill: null }, "g", LENS(0, 3)).nav;
+  assert.equal(backlog.groupByInitiative, undefined);
+  const drilled = reduceDashboardNav(
+    { tab: "matrix", cursor: 0, drill: { kind: "matrix", index: 0 }, groupByInitiative: false },
+    "g",
+    LENS(3, 0)
+  ).nav;
+  assert.equal(drilled.groupByInitiative, false); // Esc is the only drill exit
+  const switched = reduceDashboardNav(
+    { tab: "matrix", cursor: 0, drill: null, groupByInitiative: true },
+    "2",
+    LENS(3, 3)
+  ).nav;
+  assert.equal(switched.tab, "backlog");
+  assert.equal(switched.groupByInitiative, false);
+});
+
+test("matrix grouped view: initiative headers + indented stories + no-initiative bucket", () => {
+  const data = dashData({
+    matrix: parseMatrixNumeric(FIXTURE_MATRIX),
+    initiatives: parseInitiatives(INIT_INTAKES, INIT_SLICES),
+  });
+  const grouped = renderDashboardLines(bareState(), { ...nav("matrix"), groupByInitiative: true }, data, id).join("\n");
+  assert.match(grouped, /\[g\] flat/); // toggle hint flips
+  assert.match(grouped, /#44/); // initiative header
+  assert.match(grouped, /Realign griller\/kicker\/dashboard to upstream/); // summary only in grouped mode
+  assert.match(grouped, /US-001/);
+  assert.match(grouped, /US-002/);
+  assert.match(grouped, /no initiative/); // trailing bucket for unlinked stories
+  assert.match(grouped, /US-003/);
+  // the flat view does NOT show the summary header line
+  const flat = renderDashboardLines(bareState(), nav("matrix"), data, id).join("\n");
+  assert.doesNotMatch(flat, /Realign griller\/kicker\/dashboard to upstream/);
 });
 
 // ─── render: backlog tab ───────────────────────────────────────────────────
