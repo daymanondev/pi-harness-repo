@@ -330,6 +330,31 @@ test("matrix grouped view: initiative headers + indented stories + no-initiative
   assert.doesNotMatch(flat, /Realign griller\/kicker\/dashboard to upstream/);
 });
 
+// ─── reducer: 'o' openDoc action (US-042) ──────────────────────────────────
+
+console.log("=== dashboard: 'o' openDoc action (US-042) ===");
+
+test("reducer: 'o' on matrix signals openDoc (matrix-only; empty-safe)", () => {
+  // matrix with rows → openDoc
+  const a = reduceDashboardNav({ tab: "matrix", cursor: 1, drill: null }, "o", LENS(3, 0));
+  assert.equal(a.action, "openDoc");
+  // empty matrix → nothing to open (no action)
+  const b = reduceDashboardNav({ tab: "matrix", cursor: 0, drill: null }, "o", LENS(0, 0));
+  assert.equal(b.action, undefined);
+  // backlog → no openDoc (stories have packet docs; backlog items do not)
+  const c = reduceDashboardNav({ tab: "backlog", cursor: 0, drill: null }, "o", LENS(0, 3));
+  assert.equal(c.action, undefined);
+});
+
+test("reducer: 'o' works from the drilled story detail too", () => {
+  const a = reduceDashboardNav(
+    { tab: "matrix", cursor: 0, drill: { kind: "matrix", index: 0 } },
+    "o",
+    LENS(3, 0)
+  );
+  assert.equal(a.action, "openDoc");
+});
+
 // ─── render: backlog tab ───────────────────────────────────────────────────
 
 console.log("=== dashboard: renderDashboardLines (backlog tab) ===");

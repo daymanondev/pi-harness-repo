@@ -455,7 +455,7 @@ export interface DashboardNav {
  *  reducer has no row data, so it only signals). */
 export interface DashboardNavResult {
   nav: DashboardNav;
-  action?: "close" | "refresh" | "dispatch";
+  action?: "close" | "refresh" | "dispatch" | "openDoc";
 }
 
 /** Hotkey → tab. Shared by the reducer + the component. */
@@ -534,6 +534,14 @@ export function reduceDashboardNav(
   if (key === "s" && (nav.tab === "matrix" || nav.tab === "backlog")) {
     const len = lens[nav.tab] ?? 0;
     return len > 0 ? { nav, action: "dispatch" } : { nav };
+  }
+  // US-042: `o` opens the focused story's packet doc in a cmux side surface
+  //  (matrix-only — stories have packets; backlog items do not). Fires in both
+  //  list and drilled states (the cursor holds the story either way). The
+  //  reducer only signals `openDoc`; the component resolves the doc path.
+  if (key === "o" && nav.tab === "matrix") {
+    const len = lens.matrix ?? 0;
+    return len > 0 ? { nav, action: "openDoc" } : { nav };
   }
   // cursor / drill only apply to list tabs, and only when not already drilled
   if (nav.drill || !isListTab(nav.tab)) return { nav };

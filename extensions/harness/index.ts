@@ -292,7 +292,8 @@ type HarnessOverlayResult =
   | { action: "refresh" }
   | { action: "cancel" }
   | { action: "close" }
-  | { action: "dispatch"; prompt: string; id: string; tab: DashboardTab };
+  | { action: "dispatch"; prompt: string; id: string; tab: DashboardTab }
+  | { action: "openDoc"; path: string };
 
 interface HarnessOverlayOpts {
   view: HarnessView;
@@ -379,6 +380,12 @@ class HarnessOverlayComponent {
         });
       }
     }
+    else if (res.action === "openDoc") {
+      // US-042: open the focused story packet in a cmux side surface. The
+      // reducer signals; this resolves the selected story → its packet path.
+      const path = this.openDocPath();
+      if (path) this.onDone({ action: "openDoc", path });
+    }
   }
 
   /** Resolve the selected row of a dispatchable tab to a DispatchTarget.
@@ -400,6 +407,18 @@ class HarnessOverlayComponent {
       return row ? { kind: "matrix", id: row.id, title: row.title } : null;
     }
     return null;
+  }
+
+  /** US-042: resolve the focused story's packet to a repo-relative doc path
+   *  ("docs/stories/US-NNN-*.md"), or null (no packet — e.g. a planned story
+   *  with no packet yet, or a non-matrix tab). The handler joins ctx.cwd. */
+  private openDocPath(): string | null {
+    if (this.nav.tab !== "matrix") return null;
+    const filtered = filterMatrixRows(this.data.matrix, this.data.classifiedStoryIds, this.nav.matrixFilter);
+    const row = filtered[this.nav.cursor];
+    if (!row) return null;
+    const packet = this.data.packets[row.id];
+    return packet ? `docs/stories/${packet.filename}` : null;
   }
 
   render(width: number): string[] {
@@ -463,6 +482,37 @@ async function runInstallPlan(
     }
   }
   return { ok: true };
+}
+
+/** US-042: open a story/initiative doc in a cmux side surface (markdown viewer
+ *  panel with live reload). `relPath` is repo-relative (e.g.
+ *  "docs/stories/US-040-*.md"); resolved to absolute for `cmux markdown open`.
+ *  Best-effort: a missing cmux / no socket degrades to a notify, never throws.
+ *  Narrow benign un-defer of US-028 (doc display only — not provider spawn). */
+async function openDocInSurface(
+  pi: ExtensionAPI,
+  ctx: ExtensionCommandContext,
+  relPath: string
+): Promise<void> {
+  const abs = join(ctx.cwd, relPath);
+  try {
+    const res = await pi.exec("cmux", ["markdown", "open", abs], {
+      cwd: ctx.cwd,
+      signal: ctx.signal,
+      timeout: 10_000,
+    });
+    if (res.code === 0) {
+      ctx.ui.notify(`Opened ${relPath} in a side surface`, "info");
+    } else {
+      const detail = (res.stderr || res.stdout || "").trim().slice(0, 160);
+      ctx.ui.notify(`cmux markdown open failed (exit ${res.code})${detail ? ": " + detail : ""}`, "warning");
+    }
+  } catch (e) {
+    ctx.ui.notify(
+      `Could not open doc in cmux (is cmux running?): ${(e as Error).message}`,
+      "error"
+    );
+  }
 }
 
 /** Fetch + parse `query matrix --numeric` for the DASHBOARD view. Best-effort:
@@ -680,7 +730,15 @@ async function handleHarnessCommand(
           new HarnessOverlayComponent({ view, state, flags, fg, onDone: done, data }),
         { overlay: true, overlayOptions: { width: "76%", margin: 2 } }
       );
-    } while (result.action === "refresh");
+      // US-042: open the focused story packet in a cmux side surface, then keep
+      // the dashboard open (loop continues). A narrow, benign un-defer of
+      // US-028: this opens a local markdown doc via `cmux markdown open`
+      // (read-only live-reload viewer), NOT the deferred external-provider
+      // pane-spawn of ADR-0014.
+      if (result.action === "openDoc") {
+        await openDocInSurface(pi, ctx, result.path);
+      }
+    } while (result.action === "refresh" || result.action === "openDoc");
     // US-027: hand the selected list item to the agent in-session. Mirrors the
     // operator's manual "start with backlog #N / grill US-NNN / implement
     // US-NNN" — the resulting turn is indistinguishable from a typed one.
