@@ -1,16 +1,20 @@
-// tests/p4.test.ts — unit tests for the P4 DASHBOARD pure module + /harness wiring.
+// tests/p4.test.ts — unit tests for the DASHBOARD pure module + /harness wiring.
 //
 // Run: npx tsx tests/p4.test.ts
 //
 // Two layers, mirroring tests/p3.test.ts:
-//   1. Pure dashboard.ts logic (matrix/stats/backlog/tools parsers, dashboard
-//      renderer, box-width alignment, tab placeholders).
+//   1. Pure dashboard.ts logic (matrix/backlog parsers, dashboard renderer,
+//      box-width alignment, control-surface routing).
 //   2. Approach-B wiring: load the REAL index.ts, capture pi.registerCommand,
 //      drive the /harness handler against an installed+db fixture with a mock
-//      ExtensionAPI whose exec returns `query matrix/stats/backlog/tools`
-//      output. Exercises route → fetchDashboardData → overlay (dashboard) →
-//      tab switch → refresh loop → close, plus failing-query degradation —
-//      without an LLM.
+//      ExtensionAPI whose exec returns `query matrix/backlog` output. Exercises
+//      route → fetchDashboardData → overlay (dashboard) → tab switch → refresh
+//      loop → close, plus failing-query degradation — without an LLM.
+//
+// US-040: the dashboard was decluttered to Matrix + Backlog only. The earlier
+// stats/tools/drift/timeline/decisions/initiatives tab tests were removed with
+// the tabs; drift still has pure computeDrift coverage (drift.ts is live —
+// Gate B′ + the footer use it directly).
 
 import assert from "node:assert/strict";
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
@@ -20,22 +24,15 @@ import {
   parseMatrixNumeric,
   parseClassifiedStoryIds,
   parseInitiatives,
-  parseStats,
   parseBacklogOpen,
-  parseDecisionMeta,
   parseIntakesByStory,
   parseTracesByStory,
   buildProvenance,
-  parseToolsJson,
-  parseAdrBody,
   reduceDashboardNav,
   renderDashboardLines,
   nextActionFor,
   dispatchPromptFor,
   filterMatrixRows,
-  needsReverify,
-  formatAdrAge,
-  ZERO_STATS,
   type DashboardData,
   type DashboardNav,
   type DashboardTab,
@@ -83,7 +80,7 @@ const id = (_c: string, t: string) => t; // identity fg for plain-text assertion
 
 /** Build a DashboardData with empty defaults, overridden by `over`. */
 function dashData(over: Partial<DashboardData> = {}): DashboardData {
-  return { matrix: [], stats: ZERO_STATS, backlog: [], tools: [], drift: [], timeline: [], decisions: [], packets: {}, classifiedStoryIds: new Set(), provenance: new Map(), initiatives: [], errors: {}, ...over };
+  return { matrix: [], backlog: [], packets: {}, classifiedStoryIds: new Set(), provenance: new Map(), initiatives: [], errors: {}, ...over };
 }
 
 /** Build a DashboardNav for render assertions (cursor + drill default off). */
@@ -100,13 +97,6 @@ const FIXTURE_MATRIX =
   "US-002  Manager roles                                                     planned      0     0      0    0\n" +
   "US-003  Old/replaced thing                                                retired      0     0      0    0\n";
 
-// Captured `query stats` shape (title + header + separator + one data row).
-const FIXTURE_STATS =
-  "=== Harness Stats ===\n" +
-  "intakes  stories  decisions  backlog_items  traces\n" +
-  "-------  -------  ---------  -------------  ------\n" +
-  "12       12       4          4              17    \n";
-
 // Captured `query backlog --open` shape: free-text titles (incl. '<->' and "'"),
 // 2-space column gaps, trailing free-text predicted_impact the parser ignores.
 const FIXTURE_BACKLOG =
@@ -114,15 +104,6 @@ const FIXTURE_BACKLOG =
   "--  ---------------------------------------  --------  ----  ----------------  --------------\n" +
   "2   markdown<->durable status drift pattern  proposed  tiny  A cross-check makes drift visible within one session.\n" +
   "3   Gate B' over-blocks compound scripts     implemented  tiny  Inspect argv instead of substring-grepping.\n";
-
-// Captured `query tools --json` shape (native JSON; missing-status row exercises
-// the · mark, unknown fields degrade to placeholders).
-const FIXTURE_TOOLS_JSON = JSON.stringify([
-  { name: "init", kind: "builtin", responsibility: "Task state", status: "present" },
-  { name: "query matrix", kind: "builtin", responsibility: "Task state", status: "present" },
-  { name: "eslint", kind: "external", responsibility: "Verification", status: "absent" },
-  { name: "ghost", kind: "builtin" }, // missing responsibility + status → placeholders
-]);
 
 // ─── parser: matrix ────────────────────────────────────────────────────────
 
@@ -161,34 +142,6 @@ test("a malformed data row (missing proof cols) is skipped, not crashed", () => 
   assert.equal(rows[0]!.id, "US-010");
 });
 
-// ─── parser: stats ─────────────────────────────────────────────────────────
-
-console.log("=== dashboard: parseStats ===");
-test("parses the 5 counts past title + header + separator", () => {
-  const c = parseStats(FIXTURE_STATS);
-  assert.deepEqual(c, {
-    intakes: 12,
-    stories: 12,
-    decisions: 4,
-    backlogItems: 4,
-    traces: 17,
-  });
-});
-test("empty / garbage / header-only stdout → null (never throws)", () => {
-  assert.equal(parseStats(""), null);
-  assert.equal(parseStats("noise\n"), null);
-  assert.equal(parseStats("=== Harness Stats ===\nintakes  stories  decisions  backlog_items  traces\n"), null);
-});
-test("ignores a trailing extra numeric column (takes first 5)", () => {
-  const out =
-    "intakes  stories  decisions  backlog_items  traces  extra\n" +
-    "-------  -------  ---------  -------------  ------  -----\n" +
-    "1        2        3          4              5       99\n";
-  const c = parseStats(out);
-  assert.equal(c?.intakes, 1);
-  assert.equal(c?.traces, 5);
-});
-
 // ─── parser: backlog ───────────────────────────────────────────────────────
 
 console.log("=== dashboard: parseBacklogOpen ===");
@@ -209,28 +162,6 @@ test("skips header + separator (no false rows); ignores trailing free text", () 
 });
 test("empty stdout → [] (never throws)", () => {
   assert.deepEqual(parseBacklogOpen(""), []);
-});
-
-// ─── parser: tools (JSON) ──────────────────────────────────────────────────
-
-console.log("=== dashboard: parseToolsJson ===");
-test("parses JSON array into rows (name/kind/responsibility/status)", () => {
-  const rows = parseToolsJson(FIXTURE_TOOLS_JSON)!;
-  assert.equal(rows.length, 4);
-  assert.equal(rows[0]!.name, "init");
-  assert.equal(rows[0]!.status, "present");
-  assert.equal(rows[2]!.status, "absent");
-});
-test("missing fields degrade to placeholders ('-' / '?'), never throw", () => {
-  const rows = parseToolsJson(FIXTURE_TOOLS_JSON)!;
-  const ghost = rows[3]!;
-  assert.equal(ghost.responsibility, "-");
-  assert.equal(ghost.status, "?");
-});
-test("malformed JSON → null; non-array → null (never throws)", () => {
-  assert.equal(parseToolsJson("not json"), null);
-  assert.equal(parseToolsJson("{"), null);
-  assert.equal(parseToolsJson('{"a":1}'), null);
 });
 
 // ─── control-surface routing (US-023) ─────────────────────────────────────
@@ -301,13 +232,15 @@ test("US-027: backlog detail renders [s] start hint", () => {
 // ─── render: matrix tab ────────────────────────────────────────────────────
 
 console.log("=== dashboard: renderDashboardLines (matrix tab) ===");
-test("renders title, detected-state header, tab strip, footer hints", () => {
+test("renders title, detected-state header, 2-tab strip, footer hints", () => {
   const text = renderDashboardLines(bareState(), nav("matrix"), dashData({ matrix: parseMatrixNumeric(FIXTURE_MATRIX) }), id).join("\n");
   assert.match(text, /repository-harness · dashboard/);
   assert.match(text, /cli 0\.1\.11/);
   assert.match(text, /db ok/);
   assert.match(text, /1 matrix/);
-  assert.match(text, /2 stats.*3 backlog.*4 tools.*5 drift.*t timeline/);
+  assert.match(text, /2 backlog/);
+  assert.doesNotMatch(text, /\bstats\b/);
+  assert.doesNotMatch(text, /\btools\b/);
   assert.match(text, /\[r\] refresh.*\[s\] start.*\[Esc\] close/);
 });
 test("matrix tab lists every story row with status + id", () => {
@@ -323,25 +256,6 @@ test("matrix tab lists every story row with status + id", () => {
 test("empty matrix → dim empty-state row (no throw)", () => {
   const text = renderDashboardLines(bareState(), nav("matrix"), dashData(), id).join("\n");
   assert.match(text, /no stories/);
-});
-
-// ─── render: stats tab ─────────────────────────────────────────────────────
-
-console.log("=== dashboard: renderDashboardLines (stats tab) ===");
-test("renders every count label + its value", () => {
-  const text = renderDashboardLines(bareState(), nav("stats"), dashData({ stats: parseStats(FIXTURE_STATS)! }), id).join("\n");
-  assert.match(text, /intakes/);
-  assert.match(text, /stories/);
-  assert.match(text, /decisions/);
-  assert.match(text, /backlog/);
-  assert.match(text, /traces/);
-  // values from FIXTURE_STATS
-  for (const v of ["12", "4", "17"]) assert.match(text, new RegExp(`\\b${v}\\b`), `value ${v}`);
-});
-test("stats fetch error → dim error row, no counts", () => {
-  const text = renderDashboardLines(bareState(), nav("stats"), dashData({ errors: { stats: "stats" } }), id).join("\n");
-  assert.match(text, /stats unavailable/);
-  assert.doesNotMatch(text, /intakes/);
 });
 
 // ─── render: backlog tab ───────────────────────────────────────────────────
@@ -364,28 +278,7 @@ test("backlog fetch error → dim error row", () => {
   assert.match(text, /backlog unavailable/);
 });
 
-// ─── render: tools tab ─────────────────────────────────────────────────────
-
-console.log("=== dashboard: renderDashboardLines (tools tab) ===");
-test("renders every tool with ✓ for present and · for absent", () => {
-  const rows = parseToolsJson(FIXTURE_TOOLS_JSON)!;
-  const text = renderDashboardLines(bareState(), nav("tools"), dashData({ tools: rows }), id).join("\n");
-  assert.match(text, /init/);
-  assert.match(text, /query matrix/);
-  assert.match(text, /Task state/);
-  // present tools render ✓; the absent 'eslint' still lists its name
-  assert.match(text, /eslint/);
-});
-test("empty tools → dim empty-state row", () => {
-  const text = renderDashboardLines(bareState(), nav("tools"), dashData(), id).join("\n");
-  assert.match(text, /no tools registered/);
-});
-test("tools fetch error → dim error row", () => {
-  const text = renderDashboardLines(bareState(), nav("tools"), dashData({ errors: { tools: "tools" } }), id).join("\n");
-  assert.match(text, /tools unavailable/);
-});
-
-// ─── drift: pure computeDrift + Drift tab (US-012) ──────────────────────────
+// ─── drift: pure computeDrift (drift.ts is live — Gate B′ + footer) ─────────
 
 console.log("=== drift: computeDrift (pure) ===");
 test("computeDrift: clean durable↔markdown → no drift", () => {
@@ -443,94 +336,59 @@ test("fixHintFor: every kind has a non-empty hint", () => {
   for (const k of kinds) assert.ok(fixHintFor(k).length > 0, `hint for ${k}`);
 });
 
-console.log("=== dashboard: renderDashboardLines (drift tab) ===");
-test("drift tab: 'no drift' line when clean", () => {
-  const text = renderDashboardLines(bareState(), nav("drift"), dashData(), id).join("\n");
-  assert.match(text, /no drift.*markdown.*durable agree/);
-});
-test("drift tab: renders each mismatch + its fix hint", () => {
-  const drift = computeDrift(
-    { "US-9": "implemented" },
-    { "US-9": { status: "planned", evidenceMissing: false } }
-  );
-  const text = renderDashboardLines(bareState(), nav("drift"), dashData({ drift }), id).join("\n");
-  assert.match(text, /US-9/);
-  assert.match(text, /status_mismatch/);
-  assert.match(text, /implemented \| planned/);
-  assert.match(text, /## Status/); // fixHint substring
-});
-test("drift tab: dim error row when data.errors.drift", () => {
-  const text = renderDashboardLines(bareState(), nav("drift"), dashData({ errors: { drift: "drift" } }), id).join("\n");
-  assert.match(text, /drift unavailable/);
-});
-
-// ─── render: timeline tab (implemented in P5 / US-015) ─────────────────────
-// Full timeline coverage (parser, diff, rows, drill-down, degrade, wiring)
-// lives in tests/p5.test.ts. Here we only sanity-check the tab renders (it is
-// no longer the P4 placeholder) against the shared dashData() fixture.
-console.log("=== dashboard: renderDashboardLines (timeline tab renders) ===");
-test("timeline tab renders its empty-state (no longer the P5 placeholder)", () => {
-  const text = renderDashboardLines(bareState(), nav("timeline"), dashData(), id).join("\n");
-  assert.match(text, /no observer events recorded yet/);
-});
-
 // ─── drill-down: nav reducer + detail panes (US-014) ─────────────────────
 
 console.log("=== dashboard: reduceDashboardNav (pure) ===");
-const LENS = (m: number, b: number, d: number, t = 0, dec = 0) => ({ matrix: m, backlog: b, drift: d, timeline: t, decisions: dec });
+// rest-args absorbed so legacy multi-arg call shapes stay harmless.
+const LENS = (m: number, b: number, ..._rest: number[]) => ({ matrix: m, backlog: b });
 
 test("reducer: ↓/j moves cursor down, clamped to list length-1", () => {
   const start: DashboardNav = { tab: "matrix", cursor: 0, drill: null };
-  const a = reduceDashboardNav(start, "\x1b[B", LENS(3, 0, 0)).nav;
+  const a = reduceDashboardNav(start, "\x1b[B", LENS(3, 0)).nav;
   assert.equal(a.cursor, 1);
-  const b = reduceDashboardNav(a, "\x1b[B", LENS(3, 0, 0)).nav;
+  const b = reduceDashboardNav(a, "\x1b[B", LENS(3, 0)).nav;
   assert.equal(b.cursor, 2);
   // clamp at len-1
-  const c = reduceDashboardNav(b, "\x1b[B", LENS(3, 0, 0)).nav;
+  const c = reduceDashboardNav(b, "\x1b[B", LENS(3, 0)).nav;
   assert.equal(c.cursor, 2);
 });
 test("reducer: ↑/k moves cursor up, clamped to 0", () => {
   const start: DashboardNav = { tab: "matrix", cursor: 2, drill: null };
-  const a = reduceDashboardNav(start, "k", LENS(3, 0, 0)).nav;
+  const a = reduceDashboardNav(start, "k", LENS(3, 0)).nav;
   assert.equal(a.cursor, 1);
-  const b = reduceDashboardNav(a, "\x1b[A", LENS(3, 0, 0)).nav;
+  const b = reduceDashboardNav(a, "\x1b[A", LENS(3, 0)).nav;
   assert.equal(b.cursor, 0);
-  const c = reduceDashboardNav(b, "k", LENS(3, 0, 0)).nav;
+  const c = reduceDashboardNav(b, "k", LENS(3, 0)).nav;
   assert.equal(c.cursor, 0);
 });
 test("reducer: Enter drills selected row; Esc pops back (not close); Esc on list closes", () => {
   const start: DashboardNav = { tab: "matrix", cursor: 1, drill: null };
-  const d = reduceDashboardNav(start, "\r", LENS(3, 0, 0)).nav;
+  const d = reduceDashboardNav(start, "\r", LENS(3, 0)).nav;
   assert.deepEqual(d.drill, { kind: "matrix", index: 1 });
   // Esc while drilled → pop only
-  const back = reduceDashboardNav(d, "\u001b", LENS(3, 0, 0));
+  const back = reduceDashboardNav(d, "\u001b", LENS(3, 0));
   assert.equal(back.nav.drill, null);
   assert.equal(back.action, undefined);
   // Esc when not drilled → close
-  const close = reduceDashboardNav(back.nav, "\u001b", LENS(3, 0, 0));
+  const close = reduceDashboardNav(back.nav, "\u001b", LENS(3, 0));
   assert.equal(close.action, "close");
 });
-test("reducer: tab switch (1-5/t) resets cursor + drill", () => {
+test("reducer: tab switch (1/2) resets cursor + drill", () => {
   const start: DashboardNav = { tab: "matrix", cursor: 2, drill: { kind: "matrix", index: 2 } };
-  const r = reduceDashboardNav(start, "3", LENS(0, 0, 0)).nav;
+  const r = reduceDashboardNav(start, "2", LENS(0, 0)).nav;
   assert.equal(r.tab, "backlog");
   assert.equal(r.cursor, 0);
   assert.equal(r.drill, null);
 });
 test("reducer: empty list disables drill + cursor move", () => {
-  const start: DashboardNav = { tab: "drift", cursor: 0, drill: null };
-  assert.equal(reduceDashboardNav(start, "\r", LENS(0, 0, 0)).nav.drill, null);
-  assert.equal(reduceDashboardNav(start, "j", LENS(0, 0, 0)).nav.cursor, 0);
-});
-test("reducer: cursor/drill no-op on non-list tabs (stats/tools)", () => {
-  const start: DashboardNav = { tab: "stats", cursor: 0, drill: null };
-  assert.equal(reduceDashboardNav(start, "j", LENS(0, 0, 0)).nav.cursor, 0);
-  assert.equal(reduceDashboardNav(start, "\r", LENS(0, 0, 0)).nav.drill, null);
+  const start: DashboardNav = { tab: "backlog", cursor: 0, drill: null };
+  assert.equal(reduceDashboardNav(start, "\r", LENS(0, 0)).nav.drill, null);
+  assert.equal(reduceDashboardNav(start, "j", LENS(0, 0)).nav.cursor, 0);
 });
 test("reducer: drilled state ignores cursor keys + Enter (Esc is the only exit)", () => {
   const drilled: DashboardNav = { tab: "backlog", cursor: 1, drill: { kind: "backlog", index: 1 } };
-  assert.equal(reduceDashboardNav(drilled, "j", LENS(0, 5, 0)).nav.cursor, 1);
-  assert.equal(reduceDashboardNav(drilled, "\r", LENS(0, 5, 0)).nav.drill?.index, 1);
+  assert.equal(reduceDashboardNav(drilled, "j", LENS(0, 5)).nav.cursor, 1);
+  assert.equal(reduceDashboardNav(drilled, "\r", LENS(0, 5)).nav.drill?.index, 1);
 });
 
 console.log("=== dashboard: detail panes (drill-down) ===");
@@ -540,9 +398,8 @@ test("normalizeKey: Kitty CSI-u printables decode to the literal char", () => {
   assert.equal(normalizeKey("\x1b[107u"), "k"); // k
   assert.equal(normalizeKey("\x1b[114u"), "r"); // r (refresh)
   assert.equal(normalizeKey("\x1b[102u"), "f"); // f (filter)
-  assert.equal(normalizeKey("\x1b[116u"), "t"); // t (timeline)
   assert.equal(normalizeKey("\x1b[49u"), "1");  // 1 (tab)
-  assert.equal(normalizeKey("\x1b[54u"), "6");  // 6 (decisions)
+  assert.equal(normalizeKey("\x1b[50u"), "2");  // 2 (tab)
   assert.equal(normalizeKey("\x1b[105u"), "i");  // i (install confirm)
 });
 test("normalizeKey: Kitty CSI-u Esc/Enter/Up/Down → legacy bytes", () => {
@@ -557,7 +414,7 @@ test("normalizeKey: Kitty CSI-u Esc/Enter/Up/Down → legacy bytes", () => {
 test("normalizeKey: legacy bytes pass through unchanged (non-Kitty parity)", () => {
   // Every input the reducers already match must map to itself so behavior on
   // non-Kitty terminals is byte-identical.
-  for (const k of ["j", "k", "r", "f", "t", "1", "6", "i", "m", "c", "d", "\u001b", "\r", "\n", "\x1b[A", "\x1b[B", "\x1bOA", "\x1bOB"]) {
+  for (const k of ["j", "k", "r", "f", "1", "2", "i", "m", "c", "d", "\u001b", "\r", "\n", "\x1b[A", "\x1b[B", "\x1bOA", "\x1bOB"]) {
     assert.equal(normalizeKey(k), k, `legacy passthrough failed for ${JSON.stringify(k)}`);
   }
 });
@@ -576,13 +433,13 @@ test("integration: reducer + normalizeKey recognizes Kitty input like legacy", (
   // The bug: on Ghostty/Kitty, handleInput receives \x1b[106u not "j".
   // After normalizeKey, the reducer must behave exactly as it did for "j".
   const start: DashboardNav = { tab: "matrix", cursor: 0, drill: null };
-  assert.equal(reduceDashboardNav(start, normalizeKey("\x1b[106u"), LENS(3, 0, 0)).nav.cursor, 1); // j → down
-  assert.equal(reduceDashboardNav({ ...start, cursor: 2 }, normalizeKey("\x1b[107u"), LENS(3, 0, 0)).nav.cursor, 1); // k → up
-  assert.deepEqual(reduceDashboardNav(start, normalizeKey("\x1b[13u"), LENS(3, 0, 0)).nav.drill, { kind: "matrix", index: 0 }); // Enter → drill
-  assert.equal(reduceDashboardNav(start, normalizeKey("\x1b[27u"), LENS(3, 0, 0)).action, "close"); // Esc → close
-  assert.equal(reduceDashboardNav(start, normalizeKey("\x1b[57419u"), LENS(3, 0, 0)).nav.cursor, 0); // Up at 0 → clamp 0
-  assert.equal(reduceDashboardNav({ ...start, cursor: 2 }, normalizeKey("\x1b[57420u"), LENS(3, 0, 0)).nav.cursor, 2); // Down at len-1 → clamp
-  assert.equal(reduceDashboardNav(start, normalizeKey("\x1b[51u"), LENS(0, 0, 0)).nav.tab, "backlog"); // "3" → backlog tab
+  assert.equal(reduceDashboardNav(start, normalizeKey("\x1b[106u"), LENS(3, 0)).nav.cursor, 1); // j → down
+  assert.equal(reduceDashboardNav({ ...start, cursor: 2 }, normalizeKey("\x1b[107u"), LENS(3, 0)).nav.cursor, 1); // k → up
+  assert.deepEqual(reduceDashboardNav(start, normalizeKey("\x1b[13u"), LENS(3, 0)).nav.drill, { kind: "matrix", index: 0 }); // Enter → drill
+  assert.equal(reduceDashboardNav(start, normalizeKey("\x1b[27u"), LENS(3, 0)).action, "close"); // Esc → close
+  assert.equal(reduceDashboardNav(start, normalizeKey("\x1b[57419u"), LENS(3, 0)).nav.cursor, 0); // Up at 0 → clamp 0
+  assert.equal(reduceDashboardNav({ ...start, cursor: 2 }, normalizeKey("\x1b[57420u"), LENS(3, 0)).nav.cursor, 2); // Down at len-1 → clamp
+  assert.equal(reduceDashboardNav(start, normalizeKey("\x1b[50u"), LENS(0, 0)).nav.tab, "backlog"); // "2" → backlog tab
 });
 
 const PACKET = (id: string, status: string, lane: string, ac: string, ev: string) => ({
@@ -675,34 +532,34 @@ test("filterMatrixRows: undefined/unknown → all (identity, never throws)", () 
 
 test("reducer: `f` cycles matrix filter all→planned→unclassified→done→all", () => {
   let st: DashboardNav = { tab: "matrix", cursor: 0, drill: null };
-  st = reduceDashboardNav(st, "f", LENS(3, 0, 0)).nav;
+  st = reduceDashboardNav(st, "f", LENS(3, 0)).nav;
   assert.equal(st.matrixFilter, "planned");
-  st = reduceDashboardNav(st, "f", LENS(3, 0, 0)).nav;
+  st = reduceDashboardNav(st, "f", LENS(3, 0)).nav;
   assert.equal(st.matrixFilter, "unclassified");
-  st = reduceDashboardNav(st, "f", LENS(3, 0, 0)).nav;
+  st = reduceDashboardNav(st, "f", LENS(3, 0)).nav;
   assert.equal(st.matrixFilter, "done");
-  st = reduceDashboardNav(st, "f", LENS(3, 0, 0)).nav;
+  st = reduceDashboardNav(st, "f", LENS(3, 0)).nav;
   assert.equal(st.matrixFilter, "all"); // wraps done→all
 });
 test("reducer: `f` resets cursor to 0 (list content changes)", () => {
   const st: DashboardNav = { tab: "matrix", cursor: 2, drill: null };
-  const r = reduceDashboardNav(st, "f", LENS(3, 0, 0)).nav;
+  const r = reduceDashboardNav(st, "f", LENS(3, 0)).nav;
   assert.equal(r.cursor, 0);
   assert.equal(r.matrixFilter, "planned");
 });
 test("reducer: `f` is a no-op on non-matrix list tabs (backlog)", () => {
   const st: DashboardNav = { tab: "backlog", cursor: 0, drill: null };
-  const r = reduceDashboardNav(st, "f", LENS(0, 3, 0)).nav;
+  const r = reduceDashboardNav(st, "f", LENS(0, 3)).nav;
   assert.equal(r.matrixFilter, undefined);
   assert.equal(r.cursor, 0);
 });
 test("reducer: `f` is a no-op when drilled (Esc is the only exit)", () => {
   const drilled: DashboardNav = { tab: "matrix", cursor: 1, drill: { kind: "matrix", index: 1 }, matrixFilter: "planned" };
-  assert.equal(reduceDashboardNav(drilled, "f", LENS(3, 0, 0)).nav.matrixFilter, "planned");
+  assert.equal(reduceDashboardNav(drilled, "f", LENS(3, 0)).nav.matrixFilter, "planned");
 });
 test("reducer: tab switch resets matrixFilter to all", () => {
   const st: DashboardNav = { tab: "matrix", cursor: 2, drill: null, matrixFilter: "unclassified" };
-  const r = reduceDashboardNav(st, "3", LENS(0, 0, 0)).nav;
+  const r = reduceDashboardNav(st, "2", LENS(0, 0)).nav;
   assert.equal(r.tab, "backlog");
   assert.equal(r.matrixFilter, "all");
 });
@@ -710,33 +567,29 @@ test("reducer: tab switch resets matrixFilter to all", () => {
 // ─── reducer: `s` dispatch signal (US-027) ────────────────────────────────
 test("reducer: `s` on matrix (non-empty) → action dispatch", () => {
   const st: DashboardNav = { tab: "matrix", cursor: 0, drill: null };
-  assert.equal(reduceDashboardNav(st, "s", LENS(3, 0, 0)).action, "dispatch");
+  assert.equal(reduceDashboardNav(st, "s", LENS(3, 0)).action, "dispatch");
 });
 test("reducer: `s` on backlog (non-empty) → action dispatch", () => {
   const st: DashboardNav = { tab: "backlog", cursor: 0, drill: null };
-  assert.equal(reduceDashboardNav(st, "s", LENS(0, 3, 0)).action, "dispatch");
+  assert.equal(reduceDashboardNav(st, "s", LENS(0, 3)).action, "dispatch");
 });
 test("reducer: `s` on empty list → no-op (no dispatch)", () => {
   const st: DashboardNav = { tab: "backlog", cursor: 0, drill: null };
-  assert.equal(reduceDashboardNav(st, "s", LENS(0, 0, 0)).action, undefined);
-});
-test("reducer: `s` on non-dispatchable tab (stats) → no-op", () => {
-  const st: DashboardNav = { tab: "stats", cursor: 0, drill: null };
-  assert.equal(reduceDashboardNav(st, "s", LENS(0, 0, 0)).action, undefined);
+  assert.equal(reduceDashboardNav(st, "s", LENS(0, 0)).action, undefined);
 });
 test("reducer: `s` works when drilled (cursor holds the row)", () => {
   const drilled: DashboardNav = { tab: "backlog", cursor: 1, drill: { kind: "backlog", index: 1 } };
-  assert.equal(reduceDashboardNav(drilled, "s", LENS(0, 3, 0)).action, "dispatch");
+  assert.equal(reduceDashboardNav(drilled, "s", LENS(0, 3)).action, "dispatch");
 });
 test("reducer: `s` preserves nav (no cursor/filter change)", () => {
   const st: DashboardNav = { tab: "matrix", cursor: 2, drill: null, matrixFilter: "planned" };
-  const r = reduceDashboardNav(st, "s", LENS(3, 0, 0)).nav;
+  const r = reduceDashboardNav(st, "s", LENS(3, 0)).nav;
   assert.equal(r.cursor, 2);
   assert.equal(r.matrixFilter, "planned");
 });
 test("reducer: `r` refresh preserves the active matrixFilter", () => {
   const st: DashboardNav = { tab: "matrix", cursor: 0, drill: null, matrixFilter: "planned" };
-  const res = reduceDashboardNav(st, "r", LENS(3, 0, 0));
+  const res = reduceDashboardNav(st, "r", LENS(3, 0));
   assert.equal(res.action, "refresh");
   assert.equal(res.nav.matrixFilter, "planned");
 });
@@ -809,7 +662,6 @@ test("story detail: provenance lane shows intake + traces", () => {
   assert.match(text, /Provenance:/);
   assert.match(text, /intake:.*#35 spec_slice/);
   assert.match(text, /traces:.*59.*54/);
-  assert.match(text, /decisions: see decisions tab/);
 });
 test("story detail: no provenance → dim intake — + traces —", () => {
   const row = { id: "US-999", title: "Ghost", status: "planned", unit: 0, integ: 0, e2e: 0, plat: 0 };
@@ -847,28 +699,16 @@ test("backlog detail: renders full fields + detail tail", () => {
   assert.match(text, /Risk:.*normal/);
   assert.match(text, /Turns gauge into control surface/);
 });
-test("drift detail: renders mismatch sides + fix hint", () => {
-  const drift = computeDrift({ "US-9": "implemented" }, { "US-9": { status: "planned", evidenceMissing: false } });
-  const data = dashData({ drift });
-  const text = renderDashboardLines(bareState(), nav("drift", 0, { kind: "drift", index: 0 }), data, id).join("\n");
-  assert.match(text, /US-9/);
-  assert.match(text, /status_mismatch/);
-  assert.match(text, /Durable:.*implemented/);
-  assert.match(text, /Markdown:.*planned/);
-  assert.match(text, /## Status/); // fixHint substring
-});
 
 // ─── render: box-width alignment ───────────────────────────────────────────
 
 console.log("=== dashboard: box-width alignment ===");
 const fullData = dashData({
   matrix: parseMatrixNumeric(FIXTURE_MATRIX),
-  stats: parseStats(FIXTURE_STATS)!,
   backlog: parseBacklogOpen(FIXTURE_BACKLOG),
-  tools: parseToolsJson(FIXTURE_TOOLS_JSON)!,
 });
 test("every rendered line is exactly the box width (76 outer) on every tab", () => {
-  for (const tab of ["matrix", "stats", "backlog", "tools", "timeline"] as DashboardTab[]) {
+  for (const tab of ["matrix", "backlog"] as DashboardTab[]) {
     const lines = renderDashboardLines(bareState(), nav(tab), fullData, id, 76);
     for (const ln of lines) {
       assert.equal(ansiVisibleWidth(ln), 76, `${tab}: line not 76 cols: ${JSON.stringify(ln)}`);
@@ -876,7 +716,7 @@ test("every rendered line is exactly the box width (76 outer) on every tab", () 
   }
 });
 test("alignment holds at the narrower floor width (60) on every tab", () => {
-  for (const tab of ["matrix", "stats", "backlog", "tools"] as DashboardTab[]) {
+  for (const tab of ["matrix", "backlog"] as DashboardTab[]) {
     const lines = renderDashboardLines(bareState(), nav(tab), fullData, id, 60);
     for (const ln of lines) {
       assert.equal(ansiVisibleWidth(ln), 60, `${tab}: line not 60 cols: ${JSON.stringify(ln)}`);
@@ -895,12 +735,14 @@ test("dashboard FILLS the available width (no 76-col cap → no right-side void)
 
 // ─── Approach B: wiring through the REAL index.ts ──────────────────────────
 
-console.log("=== wiring: /harness → DASHBOARD route + triplet fetch ===");
+console.log("=== wiring: /harness → DASHBOARD route + fetch ===");
 
 /** A realistic `query matrix --numeric` body for the wired exec mock. */
 const WIRED_MATRIX =
   "US-001  P1 detect + footer      implemented  1  1  0  0\n" +
   "US-010  P4 dashboard shell      planned      0  0  0  0\n";
+// `query stats` is still called by detect() for the footer counts (detect.ts
+// has its own parseStats). Return a valid shape so the footer renders.
 const WIRED_STATS =
   "=== Harness Stats ===\n" +
   "intakes  stories  decisions  backlog_items  traces\n" +
@@ -910,10 +752,6 @@ const WIRED_BACKLOG =
   "id  title                       status     risk  predicted_impact\n" +
   "--  --------------------------  ---------  ----  ----------------\n" +
   "2   markdown drift cross-check  proposed   tiny  makes drift visible\n";
-const WIRED_TOOLS_JSON = JSON.stringify([
-  { name: "init", kind: "builtin", responsibility: "Task state", status: "present" },
-  { name: "query matrix", kind: "builtin", responsibility: "Task state", status: "present" },
-]);
 
 /**
  * Mock ExtensionAPI + ctx. `keySeqs[i]` is the key sequence driven on the i-th
@@ -927,12 +765,8 @@ function mockHarness(
     keySeqs?: string[][];
     matrixStdout?: string;
     matrixCode?: number;
-    statsStdout?: string;
-    statsCode?: number;
     backlogStdout?: string;
     backlogCode?: number;
-    toolsStdout?: string;
-    toolsCode?: number;
   } = {}
 ) {
   const matrixStdout = opts.matrixStdout ?? WIRED_MATRIX;
@@ -958,13 +792,10 @@ function mockHarness(
       if (args[0] === "--version")
         return { stdout: "harness-cli 0.1.11\n", stderr: "", code: 0, killed: false };
       if (args[0] === "query" && args[1] === "stats") {
-        return { stdout: opts.statsStdout ?? WIRED_STATS, stderr: "", code: opts.statsCode ?? 0, killed: false };
+        return { stdout: WIRED_STATS, stderr: "", code: 0, killed: false };
       }
       if (args[0] === "query" && args[1] === "backlog") {
         return { stdout: opts.backlogStdout ?? WIRED_BACKLOG, stderr: "", code: opts.backlogCode ?? 0, killed: false };
-      }
-      if (args[0] === "query" && args[1] === "tools") {
-        return { stdout: opts.toolsStdout ?? WIRED_TOOLS_JSON, stderr: "", code: opts.toolsCode ?? 0, killed: false };
       }
       if (args[0] === "query" && args[1] === "matrix") {
         state.matrixCalls++;
@@ -1021,7 +852,7 @@ function installedRepo(): string {
   return cwd;
 }
 
-test("installed+db → DASHBOARD route: fetches matrix/stats/backlog/tools, no installer", async () => {
+test("installed+db → DASHBOARD route: fetches matrix + backlog, no installer", async () => {
   const mod = await import("../extensions/harness/index.ts");
   const cwd = installedRepo();
   try {
@@ -1030,13 +861,17 @@ test("installed+db → DASHBOARD route: fetches matrix/stats/backlog/tools, no i
     await registeredCommands.get("harness")!("", ctx as never);
 
     assert.equal(state.customCalls, 1, "dashboard overlay opens exactly once");
-    assert.equal(state.matrixCalls, 2, "matrix fetched by fetchMatrix (--numeric) + the drift cross-check (no flag), once each per open");
-    for (const sub of ["matrix", "stats", "backlog", "tools"] as const) {
+    assert.equal(state.matrixCalls, 1, "matrix fetched once per open by fetchMatrix (--numeric)");
+    for (const sub of ["matrix", "backlog"] as const) {
       assert.ok(
         execCalls.some((c) => c.args[0] === "query" && c.args[1] === sub),
-        `must exec query ${sub} (triplet)`
+        `must exec query ${sub}`
       );
     }
+    assert.ok(
+      !execCalls.some((c) => c.args[0] === "query" && (c.args[1] === "tools" || c.args[1] === "drift")),
+      "removed tabs (tools/drift) must NOT be fetched"
+    );
     assert.ok(
       !execCalls.some((c) => c.args[0] === "-c" && /curl/.test((c.args[1] ?? ""))),
       "installer must NOT run on the dashboard route"
@@ -1050,49 +885,20 @@ test("installed+db → DASHBOARD route: fetches matrix/stats/backlog/tools, no i
   }
 });
 
-test("tab switch: '2' stats content; '3' backlog content; '4' tools content; '1' back to matrix", async () => {
+test("tab switch: '2' backlog content; '1' back to matrix", async () => {
   const mod = await import("../extensions/harness/index.ts");
   const cwd = installedRepo();
   try {
     const { pi, ctx, state, registeredCommands } = mockHarness(cwd, {
-      keySeqs: [["2", "3", "4", "1", "\u001b"]],
+      keySeqs: [["2", "1", "\u001b"]],
     });
     mod.default(pi as never);
     await registeredCommands.get("harness")!("", ctx as never);
 
     const renders = state.renders[0]!;
     assert.match(renders[0]!, /US-001/, "initial render = matrix tab");
-    assert.match(renders[1]!, /intakes/, "after '2' = stats tab content");
-    assert.match(renders[2]!, /markdown drift/, "after '3' = backlog tab content");
-    assert.match(renders[3]!, /init/, "after '4' = tools tab content");
-    assert.match(renders[4]!, /US-001/, "after '1' = back to matrix");
-  } finally {
-    rmSync(cwd, { recursive: true, force: true });
-  }
-});
-
-test("drift tab ('5'): surfaces markdown↔durable drift on the live fixture", async () => {
-  const mod = await import("../extensions/harness/index.ts");
-  const cwd = installedRepo();
-  mkdirSync(join(cwd, "docs", "stories"), { recursive: true });
-  // US-001 packet disagrees with the durable row (status_mismatch); US-010 has
-  // no packet at all (orphan_durable) — the same class Gate B′ blocks on.
-  writeFileSync(join(cwd, "docs", "stories", "US-001-foo.md"), "# US-001\n\n## Status\n\nplanned\n");
-  try {
-    // US-010 as in_progress (not planned) — planned without a packet is no longer
-    // orphan_durable after US-039 #6; in_progress still is.
-    const driftMatrix =
-      "US-001  P1 detect + footer      implemented  1  1  0  0\n" +
-      "US-010  P4 dashboard shell      in_progress  0  0  0  0\n";
-    const { pi, ctx, state, registeredCommands } = mockHarness(cwd, { keySeqs: [["5", "\u001b"]], matrixStdout: driftMatrix });
-    mod.default(pi as never);
-    await registeredCommands.get("harness")!("", ctx as never);
-    const driftRender = state.renders[0]![1]!;
-    assert.match(driftRender, /status_mismatch/);
-    assert.match(driftRender, /US-001/);
-    assert.match(driftRender, /orphan_durable/);
-    assert.match(driftRender, /US-010/);
-    assert.match(driftRender, /## Status/); // a fixHint is rendered
+    assert.match(renders[1]!, /markdown drift/, "after '2' = backlog tab content");
+    assert.match(renders[2]!, /US-001/, "after '1' = back to matrix");
   } finally {
     rmSync(cwd, { recursive: true, force: true });
   }
@@ -1109,11 +915,8 @@ test("refresh loop: 'r' re-fetches all tabs and re-opens the overlay", async () 
     await registeredCommands.get("harness")!("", ctx as never);
 
     assert.equal(state.customCalls, 2, "overlay re-opens once per refresh");
-    assert.equal(state.matrixCalls, 4, "matrix re-fetched on each refresh by both fetchMatrix + drift (2 opens × 2)");
-    // each dashboard tab query is re-fetched on both opens. (detect() also runs a
-    // cached `query stats` for the footer counts — that is the +1 over 4×2 — so
-    // assert per-subcommand rather than on the raw total.)
-    for (const sub of ["matrix", "stats", "backlog", "tools"] as const) {
+    assert.equal(state.matrixCalls, 2, "matrix re-fetched on each refresh by fetchMatrix (2 opens)");
+    for (const sub of ["matrix", "backlog"] as const) {
       const n = execCalls.filter((c) => c.args[0] === "query" && c.args[1] === sub).length;
       assert.ok(n >= 2, `query ${sub} fetched on each open (>=2); got ${n}`);
     }
@@ -1152,42 +955,6 @@ test("failing matrix query (exit 1) → empty matrix, dim empty-state, no throw"
   }
 });
 
-test("failing stats query → stats tab shows a dim error row, never throws", async () => {
-  const mod = await import("../extensions/harness/index.ts");
-  const cwd = installedRepo();
-  try {
-    const { pi, ctx, state, registeredCommands } = mockHarness(cwd, {
-      statsStdout: "",
-      statsCode: 1,
-      keySeqs: [["2", "\u001b"]],
-    });
-    mod.default(pi as never);
-    await registeredCommands.get("harness")!("", ctx as never); // must not throw
-    const statsRender = state.renders[0]![1]!;
-    assert.match(statsRender, /stats unavailable/, "stats tab degrades to error row");
-  } finally {
-    rmSync(cwd, { recursive: true, force: true });
-  }
-});
-
-test("failing tools query (bad JSON) → tools tab shows a dim error row", async () => {
-  const mod = await import("../extensions/harness/index.ts");
-  const cwd = installedRepo();
-  try {
-    const { pi, ctx, state, registeredCommands } = mockHarness(cwd, {
-      toolsStdout: "not json at all",
-      toolsCode: 0,
-      keySeqs: [["4", "\u001b"]],
-    });
-    mod.default(pi as never);
-    await registeredCommands.get("harness")!("", ctx as never);
-    const toolsRender = state.renders[0]![1]!;
-    assert.match(toolsRender, /tools unavailable/, "tools tab degrades to error row on bad JSON");
-  } finally {
-    rmSync(cwd, { recursive: true, force: true });
-  }
-});
-
 test("failing backlog query (exit 1) → backlog tab shows a dim error row, never throws", async () => {
   const mod = await import("../extensions/harness/index.ts");
   const cwd = installedRepo();
@@ -1195,7 +962,7 @@ test("failing backlog query (exit 1) → backlog tab shows a dim error row, neve
     const { pi, ctx, state, registeredCommands } = mockHarness(cwd, {
       backlogStdout: "",
       backlogCode: 1,
-      keySeqs: [["3", "\u001b"]],
+      keySeqs: [["2", "\u001b"]],
     });
     mod.default(pi as never);
     await registeredCommands.get("harness")!("", ctx as never); // must not throw
@@ -1213,7 +980,7 @@ test("US-027 dispatch: `s` on backlog → pi.sendUserMessage with triage prompt"
   const mod = await import("../extensions/harness/index.ts");
   const cwd = installedRepo();
   try {
-    const { pi, ctx, state, registeredCommands } = mockHarness(cwd, { keySeqs: [["3", "s"]] });
+    const { pi, ctx, state, registeredCommands } = mockHarness(cwd, { keySeqs: [["2", "s"]] });
     mod.default(pi as never);
     await registeredCommands.get("harness")!("", ctx as never);
     assert.equal(state.sentMessages.length, 1, "dispatch sends exactly one user message");
@@ -1250,186 +1017,9 @@ test("US-027 dispatch: Esc (no `s`) → no user message sent", async () => {
   }
 });
 
-// ─── US-024: decisions tab — ADR reader ────────────────────────────────────
+// ─── US-036: initiative link (parser kept; feeds the matrix badge, US-041) ──
 
-console.log("=== dashboard: US-024 decisions ADR reader ===");
-
-const ADR_0010 =
-  "# 0010 Workflow model — initiative + vertical slices\n\n" +
-  "Date: 2026-07-06\n\n" +
-  "## Status\n\nAccepted\n\n" +
-  "## Context\n\nOne line context.\n\nSecond line.\n\n" +
-  "## Decision\n\nDecided to adopt slices.\n\n" +
-  "## Alternatives Considered\n\n1. Intake everything upfront.\n\n" +
-  "## Consequences\n\nPositive:\n\n- Fits the budget.\n\n" +
-  "## Follow-Up\n\n- Kicker skill.\n";
-
-// minimal ADR missing the optional sections (Alternatives/Consequences/Follow-Up)
-const ADR_MINIMAL =
-  "# 0099 Tiny choice\n\n## Status\n\nProposed\n\n## Context\n\nWhy.\n\n## Decision\n\nDo it.\n";
-
-const DECISIONS_SQL =
-  "row\n" +
-  "----\n" +
-  "0008-dual-identity-in-place-build|Build pi-harness in-place|accepted||\n" +
-  "0009|P2 gate scope|accepted||\n" +
-  "0010-initiative-slices|Workflow model|accepted||\n";
-
-test("parseDecisionMeta: pipe-delimited rows → numId→meta map (joins on 4-digit number)", () => {
-  const m = parseDecisionMeta(DECISIONS_SQL);
-  assert.deepEqual(m.get("0008"), { status: "accepted", lastVerifiedAt: "", lastVerifiedResult: "" });
-  assert.deepEqual(m.get("0009"), { status: "accepted", lastVerifiedAt: "", lastVerifiedResult: "" });
-  assert.deepEqual(m.get("0010"), { status: "accepted", lastVerifiedAt: "", lastVerifiedResult: "" });
-  assert.equal(m.has("0001"), false, "absent ADR is simply missing, not synthesized");
-});
-
-test("parseDecisionMeta: header/separator/blank/garbage skipped, never throws", () => {
-  assert.equal(parseDecisionMeta("").size, 0);
-  assert.equal(parseDecisionMeta("row\n----\n").size, 0);
-  assert.equal(parseDecisionMeta("not a row at all\n").size, 0);
-});
-
-test("parseAdrBody: extracts title (H1 minus numId) + every section", () => {
-  const b = parseAdrBody(ADR_0010);
-  assert.equal(b.title, "Workflow model — initiative + vertical slices");
-  assert.equal(b.status, "Accepted");
-  assert.equal(b.context, "One line context.\n\nSecond line.");
-  assert.equal(b.decision, "Decided to adopt slices.");
-  assert.equal(b.alternatives, "1. Intake everything upfront.");
-  assert.ok(b.consequences.includes("Fits the budget."));
-  assert.equal(b.followUp, "- Kicker skill.");
-});
-
-test("parseAdrBody: missing optional sections degrade to '' (never throws)", () => {
-  const b = parseAdrBody(ADR_MINIMAL);
-  assert.equal(b.title, "Tiny choice");
-  assert.equal(b.status, "Proposed");
-  assert.equal(b.decision, "Do it.");
-  assert.equal(b.alternatives, "");
-  assert.equal(b.consequences, "");
-  assert.equal(b.followUp, "");
-});
-
-test("parseAdrBody: empty/garbage markdown → all empty fields", () => {
-  const e = parseAdrBody("");
-  assert.equal(e.title, "");
-  assert.equal(e.decision, "");
-  const g = parseAdrBody("just prose, no headings\n");
-  assert.equal(g.title, "");
-  assert.equal(g.context, "");
-});
-
-test("needsReverify: true when blank; false when a timestamp is present", () => {
-  assert.equal(needsReverify(""), true);
-  assert.equal(needsReverify("   "), true);
-  assert.equal(needsReverify("2026-07-06 12:00:00"), false);
-});
-
-test("formatAdrAge: never / today / — on garbage", () => {
-  assert.equal(formatAdrAge(""), "never");
-  assert.equal(formatAdrAge("not-a-date"), "—");
-  const iso = new Date().toISOString().slice(0, 19).replace("T", " ");
-  assert.equal(formatAdrAge(iso), "today");
-});
-
-test("reducer: '6' switches to decisions tab (resets cursor + drill)", () => {
-  const start: DashboardNav = { tab: "matrix", cursor: 2, drill: { kind: "matrix", index: 2 } };
-  const r = reduceDashboardNav(start, "6", LENS(0, 0, 0)).nav;
-  assert.equal(r.tab, "decisions");
-  assert.equal(r.cursor, 0);
-  assert.equal(r.drill, null);
-});
-
-test("reducer: decisions is a list tab — cursor moves + Enter drills", () => {
-  const base: DashboardNav = { tab: "decisions", cursor: 0, drill: null };
-  const down = reduceDashboardNav(base, "j", LENS(0, 0, 0, 0, 3)).nav;
-  assert.equal(down.cursor, 1);
-  const drill = reduceDashboardNav(down, "\r", LENS(0, 0, 0, 0, 3)).nav;
-  assert.deepEqual(drill.drill, { kind: "decisions", index: 1 });
-});
-
-test("decisions tab: lists ADR rows with id/title/status/verified", () => {
-  const data = dashData({
-    decisions: [
-      { id: "0009", filename: "0009-p2.md", body: ADR_MINIMAL, durableStatus: "accepted", lastVerifiedAt: "" },
-      { id: "0010", filename: "0010-init.md", body: ADR_0010, durableStatus: "accepted", lastVerifiedAt: "" },
-    ],
-  });
-  const text = renderDashboardLines(bareState(), nav("decisions"), data, id).join("\n");
-  assert.match(text, /0010/);
-  assert.match(text, /Workflow model/);
-  assert.match(text, /0009/);
-  assert.match(text, /accepted/);
-  assert.match(text, /verified/);
-});
-
-test("decisions tab: empty + error states degrade cleanly", () => {
-  const empty = renderDashboardLines(bareState(), nav("decisions"), dashData({ decisions: [] }), id).join("\n");
-  assert.match(empty, /no decisions/);
-  const err = renderDashboardLines(bareState(), nav("decisions"), dashData({ decisions: [], errors: { decisions: "decisions" } }), id).join("\n");
-  assert.match(err, /decisions unavailable/);
-});
-
-test("decisions detail: title + status/age + advisory re-verify + body excerpts", () => {
-  const data = dashData({
-    decisions: [
-      { id: "0010", filename: "0010-initiative-slices.md", body: ADR_0010, durableStatus: "accepted", lastVerifiedAt: "" },
-    ],
-  });
-  const text = renderDashboardLines(bareState(), nav("decisions", 0, { kind: "decisions", index: 0 }), data, id).join("\n");
-  assert.match(text, /0010/);
-  assert.match(text, /Workflow model/);
-  assert.match(text, /Status:.*accepted/);
-  assert.match(text, /Verified:.*never/);
-  assert.match(text, /re-verify:.*decision verify 0010/);
-  assert.match(text, /Context:/);
-  assert.match(text, /Decided to adopt slices/);
-  assert.match(text, /Decision:/);
-});
-
-test("decisions detail: markdown-only ADR (no durable row) uses markdown status + still advises re-verify", () => {
-  const data = dashData({
-    decisions: [
-      { id: "0099", filename: "0099-tiny.md", body: ADR_MINIMAL, durableStatus: "", lastVerifiedAt: "" },
-    ],
-  });
-  const text = renderDashboardLines(bareState(), nav("decisions", 0, { kind: "decisions", index: 0 }), data, id).join("\n");
-  assert.match(text, /Status:.*Proposed/, "status falls back to the markdown section");
-  assert.match(text, /Verified:.*never/);
-  assert.match(text, /decision verify 0099/);
-});
-
-test("wiring: decisions tab reads docs/decisions/*.md, sorts newest-first, skips README (US-024)", async () => {
-  const mod = await import("../extensions/harness/index.ts");
-  const cwd = installedRepo();
-  mkdirSync(join(cwd, "docs", "decisions"), { recursive: true });
-  writeFileSync(
-    join(cwd, "docs", "decisions", "0010-initiative-slices.md"),
-    "# 0010 Workflow model — slices\n\n## Status\n\nAccepted\n\n## Decision\n\nAdopt slices.\n"
-  );
-  writeFileSync(
-    join(cwd, "docs", "decisions", "0009-p2-gate.md"),
-    "# 0009 P2 gate scope\n\n## Status\n\nAccepted\n\n## Decision\n\nNarrow scope.\n"
-  );
-  writeFileSync(join(cwd, "docs", "decisions", "README.md"), "# decisions index\n");
-  try {
-    const { pi, ctx, state, registeredCommands } = mockHarness(cwd, { keySeqs: [["6", "\u001b"]] });
-    mod.default(pi as never);
-    await registeredCommands.get("harness")!("", ctx as never);
-    const decisionsRender = state.renders[0]![1]!;
-    assert.match(decisionsRender, /0010.*Workflow model/);
-    assert.match(decisionsRender, /0009.*P2 gate scope/);
-    assert.ok(decisionsRender.indexOf("0010") < decisionsRender.indexOf("0009"), "newest ADR (0010) renders above 0009");
-    assert.ok(!/decisions index/.test(decisionsRender), "README.md is skipped, not listed");
-    assert.match(decisionsRender, /Accepted/, "markdown-only ADR status renders");
-  } finally {
-    rmSync(cwd, { recursive: true, force: true });
-  }
-});
-
-// ─── US-036: initiatives tab — initiative → slices hierarchy ────────────
-
-console.log("=== dashboard: US-036 initiatives hierarchy ===");
+console.log("=== dashboard: initiative link (US-036) ===");
 test("parseInitiatives: groups slices by parent_intake_id, newest initiative first", () => {
   const intakes = "44|Realign to upstream\n29|Control-surface initiative\n";
   const slices =
@@ -1448,45 +1038,14 @@ test("parseInitiatives: empty/garbage → empty list (never throws)", () => {
   assert.deepEqual(parseInitiatives("", ""), []);
   assert.deepEqual(parseInitiatives("id\n--\nnope\n", "garbage|not|a|slice"), []);
 });
-test("initiatives tab: renders intake header + indented slices", () => {
+test("story detail: shows the initiative link (#parent_intake_id)", () => {
+  const row = { id: "US-036", title: "Dashboard classified badge", status: "planned", unit: 0, integ: 0, e2e: 0, plat: 0 };
   const data = dashData({
-    matrix: [],
-    classifiedStoryIds: new Set(["US-036"]),
-    initiatives: [
-      {
-        intakeId: 44,
-        summary: "Realign to upstream",
-        slices: [
-          { id: "US-033", title: "Slice link", status: "planned" },
-          { id: "US-036", title: "Dashboard", status: "planned" },
-        ],
-      },
-    ],
+    matrix: [row],
+    initiatives: [{ intakeId: 44, summary: "Realign to upstream", slices: [{ id: "US-036", title: "Dashboard", status: "planned" }] }],
   });
-  const text = renderDashboardLines(bareState(), nav("initiatives"), data, id).join("\n");
-  assert.match(text, /#44/);
-  assert.match(text, /Realign to upstream/);
-  assert.match(text, /US-033/);
-  assert.match(text, /US-036/);
-});
-test("initiatives tab: empty → empty-state row", () => {
-  const data = dashData({ initiatives: [] });
-  const text = renderDashboardLines(bareState(), nav("initiatives"), data, id).join("\n");
-  assert.match(text, /no initiatives/);
-});
-test("reducer: `7` switches to the initiatives tab", () => {
-  const st: DashboardNav = { tab: "matrix", cursor: 2, drill: null };
-  assert.equal(reduceDashboardNav(st, "7", LENS(0, 0, 0)).nav.tab, "initiatives");
-});
-test("reducer: `s` on initiatives (non-empty) → action dispatch", () => {
-  const st: DashboardNav = { tab: "initiatives", cursor: 0, drill: null };
-  const lens = { matrix: 0, backlog: 0, drift: 0, timeline: 0, decisions: 0, initiatives: 2 };
-  assert.equal(reduceDashboardNav(st, "s", lens).action, "dispatch");
-});
-test("reducer: `s` on initiatives (empty) → no-op", () => {
-  const st: DashboardNav = { tab: "initiatives", cursor: 0, drill: null };
-  const lens = { matrix: 0, backlog: 0, drift: 0, timeline: 0, decisions: 0, initiatives: 0 };
-  assert.equal(reduceDashboardNav(st, "s", lens).action, undefined);
+  const text = renderDashboardLines(bareState(), nav("matrix", 0, { kind: "matrix", index: 0 }), data, id).join("\n");
+  assert.match(text, /initiative:.*#44/);
 });
 
 void run();

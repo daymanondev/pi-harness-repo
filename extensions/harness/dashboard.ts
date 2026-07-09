@@ -6,42 +6,31 @@
 // aligned when `fg` injects SGR escapes. Every function below is unit-testable
 // with a stub `fg` (identity `(c, t) => t`).
 //
-// US-010 (tracer bullet): ships the shell + tab chrome + the proof-matrix tab.
-// Tabs 2/3/4 (stats/backlog/tools → US-011) and `t` timeline (US-015) are all
-// implemented; the chrome lists every tab honestly.
+// US-040 (dashboard focus rework, intake #56): the overlay was decluttered to
+// just two top-level tabs — Matrix + Backlog (the two surfaces that carry
+// signal in daily use). The earlier stats/tools/drift/timeline/decisions/
+// initiatives tabs were removed; drift detection still runs (Gate B′ + the
+// footer use drift.ts directly, not a tab). The story detail pane keeps its
+// provenance lane + the initiative link (parent_intake_id), so the surviving
+// surfaces still show everything actionable.
 //
 // Data source: `harness-cli query matrix --numeric` — a fixed-column table with
 // NO `--json` flag (open Q1, DESIGN §13.3). The parser keys off the stable
 // `US-NNN` id + the trailing 4 numeric proof columns, so it tolerates
 // variable-width titles (spaces, punctuation) without column-position math.
-// If parsing ever proves fragile, push `--json` upstream (roadmap open Q1).
 
 import type { HarnessState } from "./detect.js";
-import { parseMarkdownStatus, type DriftRecord } from "./drift.js";
+import { parseMarkdownStatus } from "./drift.js";
 import { type FgFn, BOX_WIDTH, box, isEnter, isEscape, padRight, truncateAnsi } from "./overlay.js";
 
 // ─── tabs ──────────────────────────────────────────────────────────────────
 
-export type DashboardTab =
-  | "matrix"
-  | "stats"
-  | "backlog"
-  | "tools"
-  | "drift"
-  | "timeline"
-  | "decisions"
-  | "initiatives";
+export type DashboardTab = "matrix" | "backlog";
 
 /** Tab chrome definition: `key` is the single hotkey that activates the tab. */
 export const DASHBOARD_TABS: { tab: DashboardTab; label: string; key: string }[] = [
   { tab: "matrix", label: "matrix", key: "1" },
-  { tab: "stats", label: "stats", key: "2" },
-  { tab: "backlog", label: "backlog", key: "3" },
-  { tab: "tools", label: "tools", key: "4" },
-  { tab: "drift", label: "drift", key: "5" },
-  { tab: "timeline", label: "timeline", key: "t" },
-  { tab: "decisions", label: "decisions", key: "6" },
-  { tab: "initiatives", label: "initiatives", key: "7" },
+  { tab: "backlog", label: "backlog", key: "2" },
 ];
 
 // ─── matrix parser (`query matrix --numeric`) ──────────────────────────────
@@ -103,66 +92,6 @@ export function parseMatrixNumeric(stdout: string): MatrixRow[] {
   return rows;
 }
 
-// ─── stats parser (`query stats`) ──────────────────────────────────────────
-
-export interface StatsCounts {
-  intakes: number;
-  stories: number;
-  decisions: number;
-  backlogItems: number;
-  traces: number;
-}
-
-/** Zero-value counts, used as the default when the stats query fails. */
-export const ZERO_STATS: StatsCounts = {
-  intakes: 0,
-  stories: 0,
-  decisions: 0,
-  backlogItems: 0,
-  traces: 0,
-};
-
-/** The five count labels rendered in the stats tab, in display order. */
-const STATS_LABELS: { key: keyof StatsCounts; label: string }[] = [
-  { key: "intakes", label: "intakes" },
-  { key: "stories", label: "stories" },
-  { key: "decisions", label: "decisions" },
-  { key: "backlogItems", label: "backlog" },
-  { key: "traces", label: "traces" },
-];
-
-/**
- * Parse `query stats` stdout into counts. Pure + total: scans past the
- * `=== Harness Stats ===` title, the column-header line, and the `---` separator,
- * then reads the first line of 5+ integers. Returns null when the shape is
- * absent (caller treats null as a fetch failure → dim error row).
- */
-export function parseStats(stdout: string): StatsCounts | null {
-  const lines = stdout.split(/\r?\n/).map((l) => l.replace(/\s+$/, ""));
-  let sawHeader = false;
-  for (const line of lines) {
-    if (!line.trim()) continue;
-    if (line.trim().startsWith("=")) continue; // "=== Harness Stats ==="
-    if (/^[-\s]+$/.test(line)) continue; // separator "------- -------"
-    if (/intakes/.test(line) && /traces/.test(line)) {
-      sawHeader = true;
-      continue;
-    }
-    if (!sawHeader) continue;
-    const nums = line.trim().split(/\s+/).map(Number);
-    if (nums.length >= 5 && nums.every((n) => Number.isInteger(n))) {
-      return {
-        intakes: nums[0]!,
-        stories: nums[1]!,
-        decisions: nums[2]!,
-        backlogItems: nums[3]!,
-        traces: nums[4]!,
-      };
-    }
-  }
-  return null;
-}
-
 // ─── backlog parser (`query backlog --open`) ───────────────────────────────
 
 export interface BacklogRow {
@@ -206,253 +135,6 @@ export function parseBacklogOpen(stdout: string): BacklogRow[] {
   return rows;
 }
 
-// ─── tools parser (`query tools --json`) ───────────────────────────────────
-
-export interface ToolRow {
-  name: string;
-  kind: string;
-  responsibility: string;
-  status: string;
-}
-
-/**
- * Parse `query tools --json` stdout into rows. Unlike the other three queries,
- * `query tools` ships a native `--json` flag, so this is a structured parse —
- * no fixed-column math. Returns null on JSON failure (caller → dim error row).
- * Unknown/missing fields degrade to placeholders, never throw.
- */
-export function parseToolsJson(stdout: string): ToolRow[] | null {
-  let arr: unknown;
-  try {
-    arr = JSON.parse(stdout);
-  } catch {
-    return null;
-  }
-  if (!Array.isArray(arr)) return null;
-  const rows: ToolRow[] = [];
-  for (const t of arr) {
-    if (!t || typeof t !== "object") continue;
-    const o = t as Record<string, unknown>;
-    rows.push({
-      name: String(o.name ?? "?"),
-      kind: String(o.kind ?? "-"),
-      responsibility: String(o.responsibility ?? "-"),
-      status: String(o.status ?? "?"),
-    });
-  }
-  return rows;
-}
-
-// ─── timeline parser (`.harness-observer/events.jsonl`) ────────────────────
-
-/** One harness-observer flow event. The observer wraps harness-cli and writes
- *  one JSONL line per call; `db_before`/`db_after` are per-table count maps the
- *  timeline renders as the `table: before → after` delta (DESIGN §8.2). */
-export interface TimelineEvent {
-  ts: string;
-  cmd: string[];
-  exit: number;
-  durationMs: number;
-  stdout: string;
-  stderr: string;
-  dbBefore: Record<string, number>;
-  dbAfter: Record<string, number>;
-}
-
-/** Maximum events rendered in the timeline (DESIGN §8.2: "last 50 calls").
- *  fetchTimeline caps to this; the renderer shows all of `data.timeline`. */
-export const TIMELINE_MAX = 50;
-
-/** Coerce an unknown `db_before`/`db_after` value into a {table: count} map,
- *  dropping non-numeric entries. Never throws. */
-function toCounts(v: unknown): Record<string, number> {
-  if (!v || typeof v !== "object") return {};
-  const out: Record<string, number> = {};
-  for (const [k, val] of Object.entries(v as Record<string, unknown>)) {
-    if (typeof val === "number" && Number.isFinite(val)) out[k] = val;
-  }
-  return out;
-}
-
-/** Parse `.harness-observer/events.jsonl` text into events. Pure + total: blank
- *  lines and unparseable / non-object lines are silently skipped, so a partial
- *  or hand-edited log never throws. Missing fields degrade to zero / empty. */
-export function parseEventsJsonl(text: string): TimelineEvent[] {
-  const out: TimelineEvent[] = [];
-  for (const raw of text.split(/\r?\n/)) {
-    const line = raw.trim();
-    if (!line) continue;
-    let o: unknown;
-    try {
-      o = JSON.parse(line);
-    } catch {
-      continue;
-    }
-    if (!o || typeof o !== "object") continue;
-    const e = o as Record<string, unknown>;
-    out.push({
-      ts: String(e.ts ?? ""),
-      cmd: Array.isArray(e.cmd) ? e.cmd.map(String) : [],
-      exit: Number(e.exit ?? 0),
-      durationMs: Number(e.duration_ms ?? 0),
-      stdout: String(e.stdout ?? ""),
-      stderr: String(e.stderr ?? ""),
-      dbBefore: toCounts(e.db_before),
-      dbAfter: toCounts(e.db_after),
-    });
-  }
-  return out;
-}
-
-/** Re-derive the rendered timeline tail from raw events.jsonl text (US-015).
- *  Pure + total: parse + cap to the last TIMELINE_MAX. `fetchTimeline` routes
- *  through this single seam, so a re-fetch (manual `r` refresh) is always a
- *  fresh idempotent re-derivation from the *current* file contents. Returning
- *  `[]` on empty/garbage is correct: the renderer then shows the "no events"
- *  dim row. (US-016's live-tail watcher was retired — see decision 0013.) */
-export function readTimelineTail(text: string): TimelineEvent[] {
-  return parseEventsJsonl(text).slice(-TIMELINE_MAX);
-}
-
-/** The changed-table delta for an event: only tables where before ≠ after
- *  (reads / `--version` yield [] since both maps are empty or equal). This is
- *  the `intake: 2 → 3` headline the timeline exists to surface. */
-export function timelineDiff(ev: TimelineEvent): { table: string; before: number; after: number }[] {
-  const tables = new Set<string>([...Object.keys(ev.dbBefore), ...Object.keys(ev.dbAfter)]);
-  const out: { table: string; before: number; after: number }[] = [];
-  for (const table of tables) {
-    const before = ev.dbBefore[table] ?? 0;
-    const after = ev.dbAfter[table] ?? 0;
-    if (before !== after) out.push({ table, before, after });
-  }
-  return out;
-}
-
-// ─── decisions parser (`query sql` + docs/decisions/*.md) (US-024) ────────
-
-/** Durable metadata for one ADR, parsed from the pipe-delimited `query sql`
- *  projection of the `decision` table. The dashboard reads ADR *bodies* from
- *  markdown (the durable layer is metadata-only by design — ADR-0004), so this
- *  carries only the status + verify-age signal markdown cannot provide. */
-export interface DecisionMeta {
-  status: string;
-  lastVerifiedAt: string;
-  lastVerifiedResult: string;
-}
-
-/**
- * Parse the pipe-delimited `query sql "SELECT id||'|'||title||'|'||status||'|'|
- * COALESCE(last_verified_at,'')||'|'||COALESCE(last_verified_result,'') …"`
- * output into a numId → meta map. The join key is the 4-digit ADR number: the
- * durable `id` is inconsistent (`0009` vs `0009-p2-…`), so only the numeric
- * prefix is stable across the table and the markdown filenames. Pure + total:
- * lines that do not start with a 4-digit id (header, separator, blank) are
- * skipped; never throws on partial/garbage output.
- */
-export function parseDecisionMeta(stdout: string): Map<string, DecisionMeta> {
-  const out = new Map<string, DecisionMeta>();
-  for (const raw of stdout.split(/\r?\n/)) {
-    const line = raw.replace(/\s+$/, "");
-    if (!line) continue;
-    // <numId><slug>|<title>|<status>|<last_verified_at>|<last_verified_result>
-    const m = line.match(/^(\d{4})[a-z0-9-]*\|[^|]*\|([^|]*)\|([^|]*)\|([^|]*)$/);
-    if (!m) continue;
-    out.set(m[1]!, {
-      status: m[2]!.trim(),
-      lastVerifiedAt: m[3]!.trim(),
-      lastVerifiedResult: m[4]!.trim(),
-    });
-  }
-  return out;
-}
-
-/** The parsed body of one ADR markdown file. Each section string is the trimmed
- *  body under its `## <heading>` (empty when absent — ADRs routinely omit
- *  Follow-Up / Alternatives). `title` is the H1 minus any leading `<numId>`. */
-export interface AdrBody {
-  title: string;
-  status: string;
-  context: string;
-  decision: string;
-  alternatives: string;
-  consequences: string;
-  followUp: string;
-}
-
-/** First `# ` heading of a markdown doc, trimmed of the leading `#` and any
- *  leading `<numId>` token (the template's H1 is `# 0010 <title>`). "" if none. */
-function parseAdrTitle(md: string): string {
-  const m = md.match(/^#\s+(.*)$/m);
-  if (!m) return "";
-  return m[1]!.trim().replace(/^\d{4}\s+/, "");
-}
-
-/**
- * Pure ADR-body parser (US-024). Extracts the title (H1) + each `## <heading>`
- * section via the shared `extractSection` helper. The single source of truth
- * for body rendering; the detail pane only formats its output. Total: missing
- * sections degrade to "" — never throws on a malformed/partial ADR.
- */
-export function parseAdrBody(md: string): AdrBody {
-  return {
-    title: parseAdrTitle(md),
-    status: extractSection(md, "Status"),
-    context: extractSection(md, "Context"),
-    decision: extractSection(md, "Decision"),
-    alternatives: extractSection(md, "Alternatives Considered"),
-    consequences: extractSection(md, "Consequences"),
-    followUp: extractSection(md, "Follow-Up"),
-  };
-}
-
-/** One ADR as the dashboard consumes it: the readable body (markdown) joined to
- *  the durable verify-age signal on the 4-digit number. */
-export interface AdrRow {
-  /** 4-digit ADR number, e.g. "0010" — canonical id, sort key, verify id. */
-  id: string;
-  /** Markdown filename, e.g. "0010-initiative-slices-workflow-model.md". */
-  filename: string;
-  /** Raw markdown body ("" only if the file was unreadable). */
-  body: string;
-  /** Durable status ("accepted"…) — "" when the ADR has no durable row. */
-  durableStatus: string;
-  /** `last_verified_at` from the durable layer — "" when never/untracked. */
-  lastVerifiedAt: string;
-}
-
-/** Re-verify advisory fires when an ADR was never verified (no durable
- *  `last_verified_at`). Pure: trivially unit-testable. Age-based staleness is
- *  deferred — no in-repo ADR has been verified yet, so any threshold would be
- *  arbitrary until the first `decision verify` lands. */
-export function needsReverify(lastVerifiedAt: string): boolean {
-  return lastVerifiedAt.trim() === "";
-}
-
-/** Human verify-age for the detail view: "never" when blank, else "Nd ago" /
- *  "today". Pure + total; a non-parseable timestamp degrades to "—". */
-export function formatAdrAge(lastVerifiedAt: string): string {
-  const s = lastVerifiedAt.trim();
-  if (!s) return "never";
-  // durable timestamps are sqlite datetime('now') → "YYYY-MM-DD HH:MM:SS"
-  const t = Date.parse(s.replace(" ", "T"));
-  if (!Number.isFinite(t)) return "—";
-  const days = Math.floor((Date.now() - t) / 86_400_000);
-  if (days <= 0) return "today";
-  if (days === 1) return "1d ago";
-  if (days < 30) return `${days}d ago`;
-  if (days < 365) return `${Math.floor(days / 30)}mo ago`;
-  return `${Math.floor(days / 365)}y ago`;
-}
-
-// ─── dashboard data aggregate (all tabs) ─────────────────────────────────────────────
-
-/**
- * All parsed tab data + a per-tab error map. Renderers are pure functions of
- * this object: a present `errors[tab]` wins over the data and renders a dim
- * error row, so a failing query never throws out of the overlay. `matrix` keeps
- * US-010's empty-on-failure semantics (it has its own empty-state row).
- */
-
 // ─── provenance (US-025): per-story intake + trace links ───────────────────
 
 /** One intake linked to a story (the durable `intake.story_id` FK). */
@@ -463,8 +145,7 @@ export interface StoryProvenanceIntake {
 
 /** The provenance behind one story: its linked intakes + trace ids (Tier 2
  *  evidence — US-025). Decisions are omitted: the `decision` table has no
- *  `story_id` FK, so there is no durable per-story decision link; the DECISIONS
- *  tab / US-024 owns decision surfacing. */
+ *  `story_id` FK, so there is no durable per-story decision link. */
 export interface StoryProvenance {
   intakes: StoryProvenanceIntake[];
   /** Trace ids, latest first. */
@@ -542,8 +223,9 @@ export interface InitiativeSlice {
 }
 
 /** One initiative (a `new_initiative` intake) and its linked slice stories.
- *  The dashboard renders the intake as a group header + its slices indented
- *  beneath, so the operator sees which slice belongs to which initiative. */
+ *  Kept after the US-040 declutter: the story detail pane + the matrix initiative
+ *  badge (US-041) consume it via `parent_intake_id`, even though there is no
+ *  dedicated initiatives tab anymore. */
 export interface InitiativeGroup {
   intakeId: number;
   summary: string;
@@ -551,7 +233,7 @@ export interface InitiativeGroup {
 }
 
 /**
- * Parse the two `query sql` projections that back the INITIATIVES tab (US-036)
+ * Parse the two `query sql` projections that back the initiative link (US-036)
  * into a group list, newest initiative first. `intakesStdout` is
  * `<id>|<summary>` rows from `new_initiative` intakes; `slicesStdout` is
  * `<parent_intake_id>|<story_id>|<title>|<status>` rows from stories with a
@@ -585,16 +267,17 @@ export function parseInitiatives(
   return [...groups.values()].sort((a, b) => b.intakeId - a.intakeId);
 }
 
+// ─── dashboard data aggregate ──────────────────────────────────────────────
+
+/**
+ * All parsed tab data + a per-tab error map. Renderers are pure functions of
+ * this object: a present `errors[tab]` wins over the data and renders a dim
+ * error row, so a failing query never throws out of the overlay. `matrix` keeps
+ * US-010's empty-on-failure semantics (it has its own empty-state row).
+ */
 export interface DashboardData {
   matrix: MatrixRow[];
-  stats: StatsCounts;
   backlog: BacklogRow[];
-  tools: ToolRow[];
-  drift: DriftRecord[];
-  /** Last N observer events for the TIMELINE tab (US-015). */
-  timeline: TimelineEvent[];
-  /** ADRs for the DECISIONS tab (US-024): markdown bodies + durable age. */
-  decisions: AdrRow[];
   /** storyId → packet file (filename + raw markdown), for the story detail pane. */
   packets: Record<string, PacketRef>;
   /** Story ids linked by ANY intake = the classified set (US-023, reworked
@@ -603,8 +286,9 @@ export interface DashboardData {
   /** storyId → linked intakes + trace ids (Tier 2 provenance, US-025). Drives
    *  the detail-pane Provenance lane. Empty map when no story has links yet. */
   provenance: Map<string, StoryProvenance>;
-  /** Initiative → slices groups for the INITIATIVES tab (US-036). Empty when no
-   *  `new_initiative` intake has linked slices yet. */
+  /** Initiative → slices groups (US-036). Drives the story-detail initiative link
+   *  + the matrix initiative badge (US-041). Empty when no `new_initiative`
+   *  intake has linked slices yet. */
   initiatives: InitiativeGroup[];
   errors: Partial<Record<DashboardTab, string>>;
 }
@@ -744,7 +428,7 @@ export function filterMatrixRows(
 // ─── drill-down navigation (US-014) ────────────────────────────────────────
 
 /** Tabs whose body is a selectable list (cursor + drill apply). */
-export type ListTab = "matrix" | "backlog" | "drift" | "timeline" | "decisions" | "initiatives";
+export type ListTab = "matrix" | "backlog";
 
 /** Which list row is drilled open (kind = which list, index = row). */
 export interface DrillTarget {
@@ -774,16 +458,10 @@ export interface DashboardNavResult {
 /** Hotkey → tab. Shared by the reducer + the component. */
 const TAB_KEYS: Record<string, DashboardTab> = {
   "1": "matrix",
-  "2": "stats",
-  "3": "backlog",
-  "4": "tools",
-  "5": "drift",
-  t: "timeline",
-  "6": "decisions",
-  "7": "initiatives",
+  "2": "backlog",
 };
 
-const LIST_TABS: ReadonlySet<ListTab> = new Set(["matrix", "backlog", "drift", "timeline", "decisions"]);
+const LIST_TABS: ReadonlySet<ListTab> = new Set(["matrix", "backlog"]);
 
 function isListTab(tab: DashboardTab): tab is ListTab {
   return LIST_TABS.has(tab as ListTab);
@@ -825,7 +503,7 @@ function extractSection(text: string, heading: string): string {
  * thin shell over this, so the full key model is unit-testable without pi.
  *
  * - Esc: pop drill if drilled, else close.
- * - `r`: refresh. `1`-`5`/`t`: switch tab (resets cursor + drill).
+ * - `r`: refresh. `1`/`2`: switch tab (resets cursor + drill).
  * - ↑/`k`, ↓/`j`: move cursor on a list tab (clamped; no-op when drilled, on a
  *   non-list tab, or the list is empty).
  * - Enter: drill into the selected row of a list tab (no-op when drilled, on a
@@ -837,7 +515,7 @@ function extractSection(text: string, heading: string): string {
 export function reduceDashboardNav(
   nav: DashboardNav,
   key: string,
-  lens: { matrix: number; backlog: number; drift: number; timeline: number; decisions: number; initiatives?: number }
+  lens: { matrix: number; backlog: number }
 ): DashboardNavResult {
   if (isEscape(key)) {
     return nav.drill ? { nav: { ...nav, drill: null } } : { nav, action: "close" };
@@ -850,7 +528,7 @@ export function reduceDashboardNav(
   // tabs — in both list and drilled states (the cursor holds the row either
   // way). The reducer only signals `dispatch`; the component owns the
   // selected-row → prompt build (it has the data, the reducer does not).
-  if (key === "s" && (nav.tab === "matrix" || nav.tab === "backlog" || nav.tab === "initiatives")) {
+  if (key === "s" && (nav.tab === "matrix" || nav.tab === "backlog")) {
     const len = lens[nav.tab] ?? 0;
     return len > 0 ? { nav, action: "dispatch" } : { nav };
   }
@@ -942,28 +620,15 @@ export function renderDashboardLines(
     content.push(...renderDetail(nav.drill, drillData, fg, innerW));
   } else if (nav.tab === "matrix") {
     content.push(...renderMatrixTab(filteredMatrix, data.classifiedStoryIds, matrixFilter, nav.cursor, fg, innerW));
-  } else if (nav.tab === "stats") {
-    content.push(...renderStatsTab(data, fg, innerW));
-  } else if (nav.tab === "backlog") {
+  } else {
     content.push(...renderBacklogTab(data, nav.cursor, fg, innerW));
-  } else if (nav.tab === "tools") {
-    content.push(...renderToolsTab(data, fg, innerW));
-  } else if (nav.tab === "drift") {
-    content.push(...renderDriftTab(data, nav.cursor, fg, innerW));
-  } else if (nav.tab === "timeline") {
-    content.push(...renderTimelineTab(data, nav.cursor, fg, innerW));
-  } else if (nav.tab === "decisions") {
-    content.push(...renderDecisionsTab(data, nav.cursor, fg, innerW));
-  } else if (nav.tab === "initiatives") {
-    content.push(...renderInitiativesTab(data, nav.cursor, fg, innerW));
   }
   content.push("");
 
   // ── footer hints (context-sensitive: drilled vs list; [s] on dispatchable tabs) ──
-  // `[1-6,t] tabs` is omitted — the tab strip above already labels each tab
-  // with its hotkey; repeating it here pushed `[Esc] close` past the 76-col
-  // truncation once `[s] start` was added (US-027).
-  const dispatchable = nav.tab === "matrix" || nav.tab === "backlog" || nav.tab === "initiatives";
+  // `[1,2] tabs` is omitted — the tab strip above already labels each tab with
+  // its hotkey.
+  const dispatchable = nav.tab === "matrix" || nav.tab === "backlog";
   content.push(
     dim(
       nav.drill
@@ -1052,20 +717,6 @@ function backlogStatusColor(status: string): string {
   return "dim"; // rejected / unknown — never throws
 }
 
-/** Render the stats tab body: one labeled count per row. innerW = inner width. */
-function renderStatsTab(data: DashboardData, fg: FgFn, _innerW: number): string[] {
-  const dim = (t: string) => fg("dim", t);
-  if (data.errors.stats) {
-    return [dim("(stats unavailable — query stats failed)")];
-  }
-  const out: string[] = [];
-  const labelW = 12;
-  for (const { key, label } of STATS_LABELS) {
-    out.push(padRight(dim(label), labelW) + fg("accent", String(data.stats[key])));
-  }
-  return out;
-}
-
 /** Render the backlog tab body (column header + open rows, with a selection
  *  cursor for drill-down). innerW = inner width. */
 function renderBacklogTab(data: DashboardData, cursor: number, fg: FgFn, innerW: number): string[] {
@@ -1109,231 +760,6 @@ function renderBacklogTab(data: DashboardData, cursor: number, fg: FgFn, innerW:
   return out;
 }
 
-/** Render the tools tab body (column header + equipped/missing rows). innerW = inner width. */
-function renderToolsTab(data: DashboardData, fg: FgFn, innerW: number): string[] {
-  const dim = (t: string) => fg("dim", t);
-  if (data.errors.tools) {
-    return [dim("(tools unavailable — query tools failed)")];
-  }
-  const out: string[] = [];
-  const kindW = 9;
-  const statusW = 2; // ✓ (present) / · (missing)
-  const nameW = 22;
-  const gap = 2;
-  const respW = Math.max(10, innerW - (nameW + kindW + statusW + 3 * gap));
-  out.push(
-    padRight(dim("name"), nameW) +
-      gapSpaces(gap) +
-      padRight(dim("kind"), kindW) +
-      gapSpaces(gap) +
-      padRight(dim("responsibility"), respW) +
-      gapSpaces(gap) +
-      dim("✓")
-  );
-  if (data.tools.length === 0) {
-    out.push(dim("(no tools registered)"));
-    return out;
-  }
-  for (const t of data.tools) {
-    out.push(
-      padRight(truncateAnsi(t.name, nameW), nameW) +
-        gapSpaces(gap) +
-        padRight(t.kind, kindW) +
-        gapSpaces(gap) +
-        padRight(truncateAnsi(t.responsibility, respW), respW) +
-        gapSpaces(gap) +
-        (t.status === "present" ? fg("success", "✓") : fg("dim", "·"))
-    );
-  }
-  return out;
-}
-
-/** Render the Drift tab body (US-012 + US-014 cursor): markdown ↔ durable
- *  mismatches with fix hints, or a clean "no drift" line. Inner width = innerW. */
-function renderDriftTab(
-  data: DashboardData,
-  cursor: number,
-  fg: FgFn,
-  innerW: number
-): string[] {
-  const dim = (t: string) => fg("dim", t);
-  if (data.errors.drift) {
-    return [dim("(drift unavailable — detectDrift failed)")];
-  }
-  if (data.drift.length === 0) {
-    return [fg("success", "✓ no drift — markdown ↔ durable agree")];
-  }
-  const out: string[] = [];
-  const idW = 8;
-  const kindW = 18;
-  const gap = 2;
-  // reserve MARK_W cols for the leading selection marker
-  const valW = Math.max(16, innerW - (idW + kindW + 2 * gap + MARK_W));
-  out.push(
-    rowMarker(false) +
-      padRight(dim("story"), idW) +
-      gapSpaces(gap) +
-      padRight(dim("kind"), kindW) +
-      gapSpaces(gap) +
-      dim("durable | markdown")
-  );
-  data.drift.forEach((r, i) => {
-    out.push(
-      rowMarker(i === cursor) +
-        padRight(truncateAnsi(r.storyId, idW), idW) +
-        gapSpaces(gap) +
-        padRight(r.kind, kindW) +
-        gapSpaces(gap) +
-        truncateAnsi(`${r.durable} | ${r.markdown}`, valW)
-    );
-    if (r.fixHint) {
-      out.push("    " + dim("→ " + truncateAnsi(r.fixHint, innerW - 4)));
-    }
-  });
-  return out;
-}
-
-// ─── timeline render helpers (US-015) ──────────────────────────────────────
-
-/** Compact duration: 340ms / 8.0s / 12s / — (for 0 or non-finite). */
-function formatDuration(ms: number): string {
-  if (!Number.isFinite(ms) || ms < 1) return "—";
-  if (ms < 1000) return `${Math.round(ms)}ms`;
-  const s = ms / 1000;
-  return s < 100 ? `${s.toFixed(1)}s` : `${Math.round(s)}s`;
-}
-
-/** `HH:MM:SS` from an ISO-ish ts ("2026-07-04T10:11:30+00:00" → "10:11:30");
- *  "" when the time part is absent. */
-function hhmmss(ts: string): string {
-  const m = ts.match(/T(\d{2}:\d{2}:\d{2})/);
-  return m ? m[1]! : "";
-}
-
-/** Joined `table: b→a` delta string for an event (only changed tables; "" when
- *  none — reads / `--version` produce no delta). */
-function renderTimelineDiff(ev: TimelineEvent): string {
-  const segs = timelineDiff(ev);
-  if (segs.length === 0) return "";
-  return segs.map((s) => `${s.table}: ${s.before}→${s.after}`).join("  ");
-}
-
-/** Render the TIMELINE tab body (US-015): the last N observer events as flow
- *  rows — time · exit mark · cmd · duration · the db delta — with a selection
- *  cursor for drill-down. Degrades to a dim message when the file is absent or
- *  no events exist. Inner width = innerW. */
-function renderTimelineTab(data: DashboardData, cursor: number, fg: FgFn, innerW: number): string[] {
-  const dim = (t: string) => fg("dim", t);
-  if (data.errors.timeline) {
-    return [dim("(timeline unavailable — flow logging is off or .harness-observer/events.jsonl is absent)")];
-  }
-  const events = data.timeline;
-  if (events.length === 0) {
-    return [dim("(no observer events recorded yet)")];
-  }
-  const out: string[] = [];
-  const innerW2 = innerW - MARK_W;
-  const timeW = 8;
-  const exitW = 1; // ✓ / ✗
-  const durW = 8;
-  const gap = 2;
-  const cmdW = 26;
-  const diffW = Math.max(12, innerW2 - (timeW + exitW + durW + cmdW + 4 * gap));
-  out.push(
-    rowMarker(false) +
-      padRight(dim("time"), timeW) +
-      gapSpaces(gap) +
-      padRight("", exitW) +
-      gapSpaces(gap) +
-      padRight(dim("cmd"), cmdW) +
-      gapSpaces(gap) +
-      padRight(dim("dur"), durW) +
-      gapSpaces(gap) +
-      dim("delta")
-  );
-  events.forEach((ev, i) => {
-    const exitMark = ev.exit === 0 ? fg("success", "✓") : fg("error", "✗");
-    const diff = renderTimelineDiff(ev);
-    const diffSeg = diff ? fg("accent", truncateAnsi(diff, diffW)) : padRight("", diffW);
-    out.push(
-      rowMarker(i === cursor) +
-        padRight(hhmmss(ev.ts), timeW) +
-        gapSpaces(gap) +
-        padRight(exitMark, exitW) +
-        gapSpaces(gap) +
-        padRight(truncateAnsi(ev.cmd.join(" "), cmdW), cmdW) +
-        gapSpaces(gap) +
-        padRight(formatDuration(ev.durationMs), durW) +
-        gapSpaces(gap) +
-        diffSeg
-    );
-  });
-  return out;
-}
-
-// ─── decisions render (US-024) ─────────────────────────────────────────────
-
-/** ADR status → color (vocab: proposed/accepted/superseded/rejected). */
-function decisionStatusColor(status: string): string {
-  if (status === "accepted") return "success";
-  if (status === "proposed") return "warning";
-  if (status === "superseded") return "dim";
-  if (status === "rejected") return "error";
-  return "dim"; // unknown / untracked — never throws
-}
-
-/** Render the DECISIONS tab body (US-024): the ADR list (id / title / status /
- *  verify-age) with a selection cursor for drill-down. Source is markdown (where
- *  the bodies live), enriched with durable status + age; fetch sorts newest-
- *  first so the cursor index matches the drill index (US-014 invariant). */
-function renderDecisionsTab(
-  data: DashboardData,
-  cursor: number,
-  fg: FgFn,
-  innerW: number
-): string[] {
-  const dim = (t: string) => fg("dim", t);
-  if (data.errors.decisions) {
-    return [dim("(decisions unavailable — query sql or docs/decisions read failed)")];
-  }
-  const rows = data.decisions;
-  if (rows.length === 0) {
-    return [dim("(no decisions — docs/decisions/*.md is empty or absent)")];
-  }
-  const out: string[] = [];
-  const innerW2 = innerW - MARK_W;
-  const idW = 5;
-  const statusW = 10;
-  const ageW = 10;
-  const gap = 2;
-  const titleW = Math.max(12, innerW2 - (idW + statusW + ageW + 3 * gap));
-  out.push(
-    rowMarker(false) +
-      padRight(dim("id"), idW) +
-      gapSpaces(gap) +
-      padRight(dim("title"), titleW) +
-      gapSpaces(gap) +
-      padRight(dim("status"), statusW) +
-      gapSpaces(gap) +
-      dim("verified")
-  );
-  rows.forEach((r, i) => {
-    const body = parseAdrBody(r.body);
-    const status = r.durableStatus || body.status || "unknown";
-    out.push(
-      rowMarker(i === cursor) +
-        padRight(r.id, idW) +
-        gapSpaces(gap) +
-        padRight(truncateAnsi(body.title || r.filename, titleW), titleW) +
-        gapSpaces(gap) +
-        padRight(fg(decisionStatusColor(status), status), statusW) +
-        gapSpaces(gap) +
-        padRight(formatAdrAge(r.lastVerifiedAt), ageW)
-    );
-  });
-  return out;
-}
-
 // ─── detail panes (US-014 drill-down) ──────────────────────────────────────
 
 /** First N non-empty lines of a section body, each truncated to `width`. */
@@ -1348,7 +774,8 @@ function sectionLines(body: string, n: number, width: number, fg: FgFn): string[
 }
 
 /** Render the drilled STORY detail: packet-derived status/lane + classified/next
- *  routing (US-023, reworked US-036) + Acceptance + Evidence excerpts + the packet path. Pure. */
+ *  routing (US-023, reworked US-036) + the initiative link + Acceptance +
+ *  Evidence excerpts + the packet path. Pure. */
 function renderStoryDetail(
   row: MatrixRow,
   packet: PacketRef | undefined,
@@ -1371,7 +798,7 @@ function renderStoryDetail(
     out.push(`${dim("initiative:")} ${fg("accent", "#" + parentIntakeId)}`);
   }
   // US-023/US-036: classified-status (intake-linkage) + next-action routing.
-  // Advisory only; the operator runs the prompt in their own pane. Shown for
+  // Advisory only; the operator runs the prompt in his own pane. Shown for
   // every story (classified-ness is independent of packet presence).
   const action = nextActionFor(row, classifiedStoryIds);
   out.push(
@@ -1382,7 +809,6 @@ function renderStoryDetail(
   out.push(dim(`[s] start — ${action.next === "classify" ? "classify" : "implement"} ${row.id} now`));
   // US-025: Provenance lane — Tier 2 evidence for THIS story (read-only). Shown
   // for every story (independent of packet presence): intake linkage + traces.
-  // Decisions omitted — no decision.story_id FK; the DECISIONS tab owns them.
   out.push(dim("Provenance:"));
   const ints = provenance?.intakes ?? [];
   out.push(
@@ -1398,7 +824,6 @@ function renderStoryDetail(
     "  " + dim("traces:") + " " +
       (trs.length ? shown.join(", ") + (more > 0 ? dim(` (+${more} more)`) : "") : dim("—"))
   );
-  out.push("  " + dim("decisions: see decisions tab (US-024)"));
   if (!packet) {
     out.push(dim(`(no packet file — orphan durable; add docs/stories/${row.id}-*.md)`));
     return out;
@@ -1433,134 +858,10 @@ function renderBacklogDetail(row: BacklogRow, fg: FgFn, innerW: number): string[
   return out;
 }
 
-/** Render the drilled DRIFT detail: mismatch sides + the fix hint. Pure. */
-function renderDriftDetail(rec: DriftRecord, fg: FgFn, innerW: number): string[] {
-  const dim = (t: string) => fg("dim", t);
-  const out: string[] = [];
-  out.push(`${fg("warning", rec.storyId)}  ${fg("accent", rec.kind)}`);
-  out.push(`${dim("Durable:")} ${rec.durable}   ${dim("Markdown:")} ${rec.markdown}`);
-  if (rec.detail) out.push(dim(truncateAnsi(rec.detail, innerW)));
-  if (rec.fixHint) out.push(fg("accent", "→ " + truncateAnsi(rec.fixHint, innerW - 2)));
-  return out;
-}
-
-/** Render the drilled TIMELINE detail (US-015): full cmd + exit/duration + the
- *  db delta + stdout/stderr excerpts. Pure. */
-function renderTimelineDetail(ev: TimelineEvent, fg: FgFn, innerW: number): string[] {
-  const dim = (t: string) => fg("dim", t);
-  const out: string[] = [];
-  const time = hhmmss(ev.ts);
-  out.push(`${fg("accent", time || ev.ts)}  ${truncateAnsi(ev.cmd.join(" "), innerW - (time.length + 2))}`);
-  out.push(
-    `${dim("Exit:")} ${ev.exit === 0 ? fg("success", "0") : fg("error", String(ev.exit))}   ` +
-      `${dim("Duration:")} ${formatDuration(ev.durationMs)}`
-  );
-  const diff = renderTimelineDiff(ev);
-  out.push(`${dim("Delta:")} ${diff ? fg("accent", truncateAnsi(diff, innerW - 7)) : dim("(no state change)")}`);
-  const dump = (label: string, body: string): void => {
-    out.push(dim(label + ":"));
-    const text = body.trim();
-    if (!text) {
-      out.push(dim("  (empty)"));
-      return;
-    }
-    for (const l of text.split(/\r?\n/).slice(0, 6)) {
-      out.push(dim("  " + truncateAnsi(l, innerW - 2)));
-    }
-  };
-  dump("stdout", ev.stdout);
-  dump("stderr", ev.stderr);
-  return out;
-}
-
-/** Render the drilled DECISION detail (US-024): title + status/age + the
- *  advisory re-verify line (mirrors US-023's next-action) + Context/Decision/
- *  Consequences excerpts + the file path. Pure. */
-function renderAdrDetail(row: AdrRow, fg: FgFn, innerW: number): string[] {
-  const dim = (t: string) => fg("dim", t);
-  const out: string[] = [];
-  const body = parseAdrBody(row.body);
-  const status = row.durableStatus || body.status || "unknown";
-  const age = formatAdrAge(row.lastVerifiedAt);
-  out.push(`${fg("accent", row.id)}  ${truncateAnsi(body.title || row.filename, innerW - row.id.length - 2)}`);
-  out.push(`${dim("Status:")} ${fg(decisionStatusColor(status), status)}   ${dim("Verified:")} ${age === "never" ? fg("warning", age) : dim(age)}`);
-  // US-024 advisory re-verify — mirrors US-023's `→ next:` line. Warning when
-  // never verified (the actionable case); dim otherwise. Read-only: the
-  // operator runs the command; no durable write originates here (US-014).
-  out.push(`${needsReverify(row.lastVerifiedAt) ? fg("warning", "→ re-verify:") : dim("→ re-verify:")} run harness-cli decision verify ${row.id}`);
-  if (!row.body) {
-    out.push(dim(`(body unavailable — ${row.filename} unreadable)`));
-    return out;
-  }
-  out.push(dim("File: " + truncateAnsi(row.filename, innerW - 6)));
-  const section = (label: string, text: string, n: number): void => {
-    if (!text) return;
-    out.push(dim(label + ":"));
-    out.push(...sectionLines(text, n, innerW - 2, fg));
-  };
-  section("Context", body.context, 3);
-  section("Decision", body.decision, 3);
-  section("Consequences", body.consequences, 2);
-  return out;
-}
-
-/** Flatten a group list into its slice rows — the cursor indexes this flat
- *  list (initiative headers are non-selectable visual separators). */
-function flattenInitiativeSlices(groups: readonly InitiativeGroup[]): InitiativeSlice[] {
-  const out: InitiativeSlice[] = [];
-  for (const g of groups) out.push(...g.slices);
-  return out;
-}
-
 /** Find the initiative intake id a story belongs to (undefined if none). */
 function findParentIntake(groups: readonly InitiativeGroup[], storyId: string): number | undefined {
   for (const g of groups) if (g.slices.some((s) => s.id === storyId)) return g.intakeId;
   return undefined;
-}
-
-/** Render the INITIATIVES tab body (US-036): `new_initiative` intakes as group
- *  headers, each followed by its slice stories indented beneath (with the
- *  classified-badge ●/○). The cursor indexes the flat slice list; headers are
- *  non-selectable. Drill → story detail; `[s]` dispatches the selected slice. */
-function renderInitiativesTab(
-  data: DashboardData,
-  cursor: number,
-  fg: FgFn,
-  innerW: number
-): string[] {
-  const dim = (t: string) => fg("dim", t);
-  if (data.errors.initiatives) {
-    return [dim("(initiatives unavailable — query sql failed)")];
-  }
-  const groups = data.initiatives;
-  if (groups.length === 0) {
-    return [dim("(no initiatives — no new_initiative intakes with linked slices)")];
-  }
-  const out: string[] = [];
-  let sliceIdx = 0;
-  const idW = 7;
-  const gap = 2;
-  // indent (2) + badge (2) + id + gap, reserved against the marker column.
-  const titleW = Math.max(10, innerW - MARK_W - 2 - 2 - idW - gap);
-  for (const g of groups) {
-    const headW = innerW - MARK_W - String(g.intakeId).length - 3;
-    out.push(rowMarker(false) + fg("accent", "#" + g.intakeId) + "  " + dim(truncateAnsi(g.summary, Math.max(8, headW))));
-    if (g.slices.length === 0) {
-      out.push(rowMarker(false) + dim("  (no slices linked)"));
-      continue;
-    }
-    for (const s of g.slices) {
-      const sel = sliceIdx === cursor;
-      const action = nextActionFor({ id: s.id }, data.classifiedStoryIds);
-      const badge = (action.classified ? fg("success", "●") : fg("dim", "○")) + " ";
-      out.push(
-        rowMarker(sel) + "  " + badge + padRight(s.id, idW) + gapSpaces(gap) +
-          padRight(truncateAnsi(s.title, titleW), titleW)
-      );
-      sliceIdx++;
-    }
-  }
-  return out;
 }
 
 /** Dispatch a drilled target to its detail renderer (bounds-checked). */
@@ -1575,32 +876,10 @@ function renderDetail(
     if (!row) return [fg("dim", "(row no longer exists — press r to refresh)")];
     return renderStoryDetail(row, data.packets[row.id], data.classifiedStoryIds, data.provenance.get(row.id), fg, innerW, findParentIntake(data.initiatives, row.id));
   }
-  if (drill.kind === "initiatives") {
-    const slice = flattenInitiativeSlices(data.initiatives)[drill.index];
-    if (!slice) return [fg("dim", "(row no longer exists — press r to refresh)")];
-    const row: MatrixRow = data.matrix.find((r) => r.id === slice.id) ?? {
-      id: slice.id, title: slice.title, status: slice.status, unit: 0, integ: 0, e2e: 0, plat: 0,
-    };
-    return renderStoryDetail(row, data.packets[row.id], data.classifiedStoryIds, data.provenance.get(row.id), fg, innerW, findParentIntake(data.initiatives, slice.id));
-  }
-  if (drill.kind === "backlog") {
-    const row = data.backlog[drill.index];
-    if (!row) return [fg("dim", "(row no longer exists — press r to refresh)")];
-    return renderBacklogDetail(row, fg, innerW);
-  }
-  if (drill.kind === "timeline") {
-    const ev = data.timeline[drill.index];
-    if (!ev) return [fg("dim", "(row no longer exists — press r to refresh)")];
-    return renderTimelineDetail(ev, fg, innerW);
-  }
-  if (drill.kind === "decisions") {
-    const row = data.decisions[drill.index];
-    if (!row) return [fg("dim", "(row no longer exists — press r to refresh)")];
-    return renderAdrDetail(row, fg, innerW);
-  }
-  const rec = data.drift[drill.index];
-  if (!rec) return [fg("dim", "(row no longer exists — press r to refresh)")];
-  return renderDriftDetail(rec, fg, innerW);
+  // backlog
+  const row = data.backlog[drill.index];
+  if (!row) return [fg("dim", "(row no longer exists — press r to refresh)")];
+  return renderBacklogDetail(row, fg, innerW);
 }
 
 /** A single proof mark: ✓ (success) for 1, · (dim) for 0. */

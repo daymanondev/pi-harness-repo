@@ -61,14 +61,10 @@ import {
   parseMatrixNumeric,
   parseClassifiedStoryIds,
   parseInitiatives,
-  parseStats,
   parseBacklogOpen,
-  parseDecisionMeta,
   parseIntakesByStory,
   parseTracesByStory,
   buildProvenance,
-  parseToolsJson,
-  readTimelineTail,
   reduceDashboardNav,
   renderDashboardLines,
   filterMatrixRows,
@@ -79,15 +75,9 @@ import {
   type DashboardTab,
   type MatrixRow,
   type PacketRef,
-  type StatsCounts,
-  type AdrRow,
   type StoryProvenance,
   type InitiativeGroup,
   type BacklogRow,
-  type DecisionMeta,
-  type ToolRow,
-  type TimelineEvent,
-  ZERO_STATS,
 } from "./dashboard.js";
 
 const STATUS_KEY = "harness";
@@ -322,8 +312,8 @@ interface HarnessOverlayOpts {
  * passed to ctx.ui.custom accepts it positionally.
  *
  * Keys (INSTALL): Enter/i confirm · m mode · c claude · r dry-run · d initDb ·
- * Esc cancel. DASHBOARD: 1-4 tabs · t timeline · r refresh · Esc close. Only
- * single-byte keys, so no kitty/CSI sequence handling is needed.
+ * Esc cancel. DASHBOARD: 1/2 tabs (matrix/backlog) · r refresh · Esc close.
+ * Only single-byte keys, so no kitty/CSI sequence handling is needed.
  */
 class HarnessOverlayComponent {
   private view: HarnessView;
@@ -341,7 +331,7 @@ class HarnessOverlayComponent {
     this.fg = o.fg;
     this.onDone = o.onDone;
     this.nav = { tab: o.tab ?? "matrix", cursor: 0, drill: null, matrixFilter: "all" };
-    this.data = o.data ?? { matrix: [], stats: ZERO_STATS, backlog: [], tools: [], drift: [], timeline: [], decisions: [], packets: {}, classifiedStoryIds: new Set(), provenance: new Map(), initiatives: [], errors: {} };
+    this.data = o.data ?? { matrix: [], backlog: [], packets: {}, classifiedStoryIds: new Set(), provenance: new Map(), initiatives: [], errors: {} };
   }
 
   handleInput(data: string): void {
@@ -373,10 +363,6 @@ class HarnessOverlayComponent {
     const lens = {
       matrix: filteredMatrix.length,
       backlog: this.data.backlog.length,
-      drift: this.data.drift.length,
-      timeline: this.data.timeline.length,
-      decisions: this.data.decisions.length,
-      initiatives: this.data.initiatives.reduce((n, g) => n + g.slices.length, 0),
     };
     const res = reduceDashboardNav(this.nav, key, lens);
     this.nav = res.nav;
@@ -412,11 +398,6 @@ class HarnessOverlayComponent {
       );
       const row = filtered[i];
       return row ? { kind: "matrix", id: row.id, title: row.title } : null;
-    }
-    if (this.nav.tab === "initiatives") {
-      const slices = this.data.initiatives.flatMap((g) => g.slices);
-      const slice = slices[i];
-      return slice ? { kind: "matrix", id: slice.id, title: slice.title } : null;
     }
     return null;
   }
@@ -578,26 +559,6 @@ async function fetchProvenance(
   }
 }
 
-/** Fetch + parse `query stats`. Returns null on any failure (caller records an
- *  error so the stats tab degrades to a dim error row, never throws). */
-async function fetchStatsCounts(
-  pi: ExtensionAPI,
-  ctx: ExtensionCommandContext
-): Promise<StatsCounts | null> {
-  try {
-    const bin = cliBinaryPath(ctx.cwd);
-    const res = await pi.exec(bin, ["query", "stats"], {
-      cwd: ctx.cwd,
-      signal: ctx.signal,
-      timeout: 5_000,
-    });
-    if (res.code !== 0) return null;
-    return parseStats(res.stdout);
-  } catch {
-    return null;
-  }
-}
-
 /** Fetch + parse `query backlog --open`. Returns null on failure (distinct from
  *  a valid empty `[]` → "no open backlog items"). */
 async function fetchBacklogRows(
@@ -613,43 +574,6 @@ async function fetchBacklogRows(
     });
     if (res.code !== 0) return null;
     return parseBacklogOpen(res.stdout);
-  } catch {
-    return null;
-  }
-}
-
-/** Fetch + parse `query tools --json` (native JSON). Returns null on failure. */
-async function fetchToolRows(
-  pi: ExtensionAPI,
-  ctx: ExtensionCommandContext
-): Promise<ToolRow[] | null> {
-  try {
-    const bin = cliBinaryPath(ctx.cwd);
-    const res = await pi.exec(bin, ["query", "tools", "--json"], {
-      cwd: ctx.cwd,
-      signal: ctx.signal,
-      timeout: 5_000,
-    });
-    if (res.code !== 0) return null;
-    return parseToolsJson(res.stdout);
-  } catch {
-    return null;
-  }
-}
-
-/** Fetch drift records for the Drift tab (US-012). `detectDrift` reads
- *  docs/stories/*.md + runs `query matrix` itself; on exec failure it degrades
- *  to a synthetic "(query matrix failed)" record, which we map to null so the
- *  tab renders a dim error row (consistent with the other query tabs). */
-async function fetchDrift(
-  pi: ExtensionAPI,
-  ctx: ExtensionCommandContext
-): Promise<DriftRecord[] | null> {
-  try {
-    const recs = await detectDrift(ctx.cwd, makeExec(pi), { signal: ctx.signal });
-    const failed =
-      recs.length === 1 && recs[0]?.storyId === "(query matrix failed)";
-    return failed ? null : recs;
   } catch {
     return null;
   }
@@ -679,79 +603,6 @@ async function fetchPackets(
   }
 }
 
-/** Read + parse `.harness-observer/events.jsonl` for the TIMELINE tab (US-015).
- *  Unlike the query tabs this is a direct file read (the observer is a
- *  companion, not an inbound harness tool). Returns null on any failure
- *  (file absent / unreadable) so the tab degrades to a dim message, never
- *  throws. Re-derives the tail via `readTimelineTail` — the same seam the
- *  live-tail watcher uses (US-016) — so the initial fetch and live updates
- *  can never diverge. */
-async function fetchTimeline(
-  _pi: ExtensionAPI,
-  ctx: ExtensionCommandContext
-): Promise<TimelineEvent[] | null> {
-  try {
-    const file = join(ctx.cwd, ".harness-observer", "events.jsonl");
-    const text = await readFile(file, "utf8");
-    return readTimelineTail(text);
-  } catch {
-    return null;
-  }
-}
-
-/** Fetch ADRs for the DECISIONS tab (US-024). Source is `docs/decisions/*.md`
- *  (where the bodies live), enriched with durable status + verify-age from the
- *  `decision` table via a pipe-delimited `query sql` (joined on the 4-digit
- *  number — the durable `id` is inconsistent). Durable lookup is best-effort:
- *  an absent/unreadable db leaves `meta` empty so the markdown list still
- *  renders. Returns null only when the markdown dir itself is unreadable so the
- *  tab degrades to a dim error row. Sorted newest-first so the cursor index
- *  matches the drill index (US-014 invariant). */
-async function fetchDecisions(
-  pi: ExtensionAPI,
-  ctx: ExtensionCommandContext
-): Promise<AdrRow[] | null> {
-  try {
-    const dir = join(ctx.cwd, "docs", "decisions");
-    const entries = await readdir(dir);
-    // durable metadata map (numId → meta); best-effort — absent/failed ⇒ {}
-    let meta: Map<string, DecisionMeta> = new Map();
-    try {
-      const bin = cliBinaryPath(ctx.cwd);
-      const res = await pi.exec(
-        bin,
-        [
-          "query", "sql",
-          "SELECT id || '|' || status || '|' || COALESCE(last_verified_at,'') || '|' || COALESCE(last_verified_result,'') FROM decision",
-        ],
-        { cwd: ctx.cwd, signal: ctx.signal, timeout: 5_000 }
-      );
-      if (res.code === 0) meta = parseDecisionMeta(res.stdout);
-    } catch {
-      // durable lookup is best-effort; markdown list still renders
-    }
-    const out: AdrRow[] = [];
-    for (const name of entries) {
-      const m = name.match(/^(\d{4})/);
-      if (!m) continue; // skip README.md + non-ADR files
-      const numId = m[1]!;
-      const body = await readFile(join(dir, name), "utf8");
-      const d = meta.get(numId);
-      out.push({
-        id: numId,
-        filename: name,
-        body,
-        durableStatus: d?.status ?? "",
-        lastVerifiedAt: d?.lastVerifiedAt ?? "",
-      });
-    }
-    out.sort((a, b) => b.id.localeCompare(a.id));
-    return out;
-  } catch {
-    return null;
-  }
-}
-
 /** Fetch all DASHBOARD tab data in parallel and build the DashboardData the
  *  renderer consumes. A null result on a tab records an error so that tab
  *  renders a dim error row; `matrix` keeps US-010's empty-on-failure shape. */
@@ -759,34 +610,19 @@ async function fetchDashboardData(
   pi: ExtensionAPI,
   ctx: ExtensionCommandContext
 ): Promise<DashboardData> {
-  const [matrix, stats, backlog, tools, drift, packets, timeline, classifiedStoryIds, decisions, provenance, initiatives] = await Promise.all([
+  const [matrix, backlog, packets, classifiedStoryIds, provenance, initiatives] = await Promise.all([
     fetchMatrix(pi, ctx),
-    fetchStatsCounts(pi, ctx),
     fetchBacklogRows(pi, ctx),
-    fetchToolRows(pi, ctx),
-    fetchDrift(pi, ctx),
     fetchPackets(pi, ctx),
-    fetchTimeline(pi, ctx),
     fetchClassifiedStoryIds(pi, ctx),
-    fetchDecisions(pi, ctx),
     fetchProvenance(pi, ctx),
     fetchInitiatives(pi, ctx),
   ]);
   const errors: Partial<Record<DashboardTab, string>> = {};
-  if (stats === null) errors.stats = "stats";
   if (backlog === null) errors.backlog = "backlog";
-  if (tools === null) errors.tools = "tools";
-  if (drift === null) errors.drift = "drift";
-  if (timeline === null) errors.timeline = "timeline";
-  if (decisions === null) errors.decisions = "decisions";
   return {
     matrix,
-    stats: stats ?? ZERO_STATS,
     backlog: backlog ?? [],
-    tools: tools ?? [],
-    drift: drift ?? [],
-    timeline: timeline ?? [],
-    decisions: decisions ?? [],
     packets,
     classifiedStoryIds,
     provenance,
